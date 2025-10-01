@@ -40,19 +40,19 @@ from mistyPy.Events import Events
 
 def start_skill():
     misty.register_event("initTTSComplete", Events.TextToSpeechComplete, keep_alive=False, callback_function=tts_intro_completed)
-
     misty.display_image("e_defaultcontent.jpg")
     misty.move_head(0, 0, 0, 85)
-    misty.speak("I'd like to show you an image and have you tell me what you see.", None, None, None, True, "tts-content")
+    misty.speak("Hello! I'm ready to talk with you. What would you like to discuss?")
 
 def tts_intro_completed(event):
-    misty.display_image("inkblot.jpg")
-    # keep_alive defaults to false
-    misty.register_event("whatDoYouSeeTTSComplete", Events.TextToSpeechComplete, callback_function=tts_what_do_you_see_completed)
-    misty.speak("What do you see when you look at this image?", None, None, None, True, "tts-content")
+    start_conversation()
 
-def tts_what_do_you_see_completed(event):
-    misty.register_event("VoiceRecord", Events.VoiceRecord, callback_function=voice_record_complete)
+def start_conversation():
+    misty.register_event("conversationTTSComplete", Events.TextToSpeechComplete, keep_alive=False, callback_function=listen_for_speech)
+    misty.speak("Please tell me something, and I'll repeat it back to you.", None, None, None, True, "conversation-tts")
+
+def listen_for_speech(event):
+    misty.register_event("userSpeechComplete", Events.VoiceRecord, callback_function=voice_record_complete)
     misty.capture_speech_azure(True, 2000, 15000, False, False, "en-us", "<azure_cognitive_services_key>", "eastus")
 
 def voice_record_complete(event):
@@ -60,17 +60,68 @@ def voice_record_complete(event):
         parsed_message = event["message"]
         misty_heard = parsed_message["speechRecognitionResult"]
         print(f"Misty heard: {misty_heard}")
-    # do something with this data
-    misty.display_image("e_defaultcontent.jpg")
-    misty.move_head(-30, 20, -50, 85, None, None)
-    misty.register_event("finalTTSComplete", Events.TextToSpeechComplete, callback_function=tts_all_i_ever_see)
-    misty.speak("That's interesting. All I ever see is a butterfly.", None, None, None, True, "tts-content")
+        
+        # Respond back with what was heard
+        misty.register_event("responseTTSComplete", Events.TextToSpeechComplete, keep_alive=False, callback_function=continue_conversation)
+        misty.speak(f"You said: {misty_heard}", None, None, None, True, "response-tts")
+    else:
+        # If no speech was detected, ask again
+        misty.register_event("noSpeechTTSComplete", Events.TextToSpeechComplete, keep_alive=False, callback_function=listen_for_speech)
+        misty.speak("I didn't hear anything. Please try again.", None, None, None, True, "no-speech-tts")
 
-def tts_all_i_ever_see(event):
+def continue_conversation(event):
+    misty.register_event("continueTTSComplete", Events.TextToSpeechComplete, keep_alive=False, callback_function=ask_to_continue)
+    misty.speak("Would you like to say something else? Just tell me yes or no.", None, None, None, True, "continue-tts")
+
+def ask_to_continue(event):
+    misty.register_event("continueResponseComplete", Events.VoiceRecord, callback_function=handle_continue_response)
+    misty.capture_speech_azure(True, 2000, 10000, False, False, "en-us", "<azure_cognitive_services_key>", "eastus")
+
+def handle_continue_response(event):
+    if "message" in event:
+        parsed_message = event["message"]
+        response = parsed_message["speechRecognitionResult"].lower()
+        print(f"User response: {response}")
+        
+        if "yes" in response or "yeah" in response or "sure" in response:
+            misty.register_event("yesResponseComplete", Events.TextToSpeechComplete, keep_alive=False, callback_function=start_conversation)
+            misty.speak("Great! Let's continue our conversation.", None, None, None, True, "yes-response-tts")
+        else:
+            misty.register_event("noResponseComplete", Events.TextToSpeechComplete, keep_alive=False, callback_function=end_conversation)
+            misty.speak("Thank you for talking with me! Goodbye!", None, None, None, True, "no-response-tts")
+
+def end_conversation(event):
     misty.display_image("e_joy.jpg")
+    misty.speak("It was nice chatting with you!")
 
 
 if __name__ == "__main__":
-    ip_address = "192.168.1.12"
+    ip_address = "10.66.239.83"
     misty = Robot(ip_address)
     start_skill()
+
+
+def simulate_conversation():
+    """Simulate the conversation when no Misty robot is available"""
+    print("=== MISTY CONVERSATION SIMULATOR ===")
+    print("Robot: Hello! I'm ready to talk with you. What would you like to discuss?")
+    
+    while True:
+        try:
+            user_input = input("You: ")
+            if user_input.lower() in ['quit', 'exit', 'bye']:
+                print("Robot: Thank you for talking with me! Goodbye!")
+                break
+            
+            print(f"Robot: You said: {user_input}")
+            
+            continue_response = input("Robot: Would you like to say something else? (yes/no): ").lower()
+            if continue_response in ['yes', 'yeah', 'sure']:
+                print("Robot: Great! Let's continue our conversation.")
+            else:
+                print("Robot: Thank you for talking with me! Goodbye!")
+                break
+                
+        except KeyboardInterrupt:
+            print("\nRobot: Thank you for talking with me! Goodbye!")
+            break
