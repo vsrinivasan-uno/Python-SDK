@@ -100,7 +100,13 @@ class Event:
                                          on_open=self.on_open)
         self.ws.run_forever(ping_timeout=10)
 
-    def on_message(self, message):
+    def on_message(self, ws=None, message=None):
+        # Handle both old and new websocket-client API versions
+        # Old version: on_message(ws, message)
+        # New version: on_message(message) with ws as optional
+        if message is None:
+            message = ws  # New API where first arg is message
+        
         # The first message is the successful subscription message
         if self.initial_flag:
             self.initial_flag = False
@@ -112,13 +118,20 @@ class Event:
             if not self.keep_alive:
                 self.unsubscribe()
 
-    def on_error(self, error):
+    def on_error(self, ws=None, error=None):
+        # Handle both old and new websocket-client API versions
+        if error is None:
+            error = ws  # New API where first arg is error
         print(error)
 
-    def on_close(self):
+    def on_close(self, ws=None, close_status_code=None, close_msg=None):
+        # Handle both old and new websocket-client API versions
+        # This signature is compatible with both versions
         self.is_active = False
 
-    def on_open(self):
+    def on_open(self, ws=None):
+        # Handle both old and new websocket-client API versions
+        # Make ws optional to support both callback signatures
         def run(*args):
             self.ws.send(str(self.get_subscribe_message()))
 

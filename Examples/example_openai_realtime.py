@@ -23,7 +23,7 @@ def get_openai_key():
     return key
 
 class RealtimeWS:
-    def __init__(self, api_key, model="gpt-5-realtime-preview"):
+    def __init__(self, api_key, model="gpt-4o-realtime-preview"):
         self.api_key = api_key
         self.model = model
         self.ws = None
@@ -60,7 +60,7 @@ class RealtimeWS:
         print("Realtime websocket opened.")
 
     def on_message(self, ws, message):
-        # Messages are JSON events; print useful ones
+        # Messages are JSON events; parse and buffer deltas for final assembly.
         try:
             data = json.loads(message)
         except Exception:
@@ -68,15 +68,101 @@ class RealtimeWS:
             return
 
         typ = data.get("type")
-        # Many realtime responses use different event names; show transcripts and assistant messages
-        if typ in ("transcript", "message", "response.delta", "response.output_text.delta"):
-            print("Realtime event:", json.dumps(data, indent=2))
+        # ensure buffers exist
+        if not hasattr(self, "audio_buffers"):
+            self.audio_buffers = {}        # response_id -> bytearray
+            self.transcript_buffers = {}   # response_id -> str
+
+        # helper to find a response id (fallback to 'default' when missing)
+        resp_id = None
+        if isinstance(data.get("response"), dict):
+            resp_id = data["response"].get("id")
+        if not resp_id:
+            resp_id = data.get("response_id") or data.get("id") or "default"
+
+        # Handle audio chunks (base64-encoded) and transcript/text deltas.
+        if typ == "response.audio.delta":
+            # Try to find base64-encoded audio inside common fields
+            b64 = None
+            # top-level fields
+            for k in ("audio", "delta", "data", "b64", "chunk"):
+                v = data.get(k)
+                if isinstance(v, str) and len(v) > 32:
+                    b64 = v
+                    break
+            # nested delta object
+            if not b64 and isinstance(data.get("delta"), dict):
+                for k in ("audio", "b64", "data", "chunk"):
+                    v = data["delta"].get(k)
+                    if isinstance(v, str) and len(v) > 32:
+                        b64 = v
+                        break
+            if b64:
+                try:
+                    chunk = base64.b64decode(b64)
+                    self.audio_buffers.setdefault(resp_id, bytearray()).extend(chunk)
+                except Exception:
+                    # If it fails, keep moving; don't spam full payload
+                    pass
+            print(f"Realtime audio delta (response={resp_id}, bytes={len(self.audio_buffers.get(resp_id, b''))})")
+
+        elif typ == "response.audio_transcript.delta" or typ in ("response.output_text.delta", "response.delta", "transcript", "message"):
+            # Extract text from likely fields (delta.text, text, transcript, content)
+            text = None
+            for k in ("text", "transcript", "content"):
+                v = data.get(k)
+                if isinstance(v, str) and v.strip():
+                    text = v
+                    break
+            if text is None and isinstance(data.get("delta"), dict):
+                for k in ("text", "transcript", "content"):
+                    v = data["delta"].get(k)
+                    if isinstance(v, str) and v.strip():
+                        text = v
+                        break
+            if text:
+                self.transcript_buffers.setdefault(resp_id, "")
+                self.transcript_buffers[resp_id] += text
+                # Print only the newly appended text to reduce noise
+                print(f"Realtime transcript delta (response={resp_id}): {text}")
+            else:
+                # If no text found, print the raw event for debugging
+                print("Realtime event:", json.dumps(data, indent=2))
+
         else:
+            # Check for lifecycle/finalization events indicating the response is complete.
+            completed = False
+            # common explicit completed event types
+            if typ in ("response.completed", "response.done", "response.ended"):
+                completed = True
+            # or status field inside response object
+            if isinstance(data.get("response"), dict) and data["response"].get("status") in ("completed", "succeeded", "done"):
+                completed = True
+
+            if completed:
+                # Print assembled transcript and write audio if available
+                transcript = self.transcript_buffers.pop(resp_id, "")
+                audio_bytes = bytes(self.audio_buffers.pop(resp_id, b""))
+                if transcript:
+                    print(f"Realtime final transcript (response={resp_id}):\n{transcript}")
+                else:
+                    print(f"Realtime final event for response={resp_id} (no transcript buffered)")
+
+                if audio_bytes:
+                    # save audio to a file for inspection/playback
+                    try:
+                        fname = f"realtime_response_{resp_id}.wav"
+                        with open(fname, "wb") as f:
+                            f.write(audio_bytes)
+                        print(f"Saved assembled audio to {fname} ({len(audio_bytes)} bytes)")
+                    except Exception as e:
+                        print("Failed saving assembled audio:", e)
+                return
+
             # show important lifecycle or error events briefly
             if "error" in data:
                 print("Realtime error:", json.dumps(data, indent=2))
             else:
-                # minimal debug for other events
                 if typ is not None:
                     print(f"Realtime event type: {typ}")
 
@@ -92,6 +178,11 @@ class RealtimeWS:
         if not self.ws:
             return
         try:
+            # Debug: print payload before sending so we can detect unsupported params
+            try:
+                print("Sending payload:", json.dumps(payload))
+            except Exception:
+                print("Sending payload (non-serializable):", payload)
             self.ws.send(json.dumps(payload))
         except Exception as e:
             print("Failed to send json:", e)
@@ -106,12 +197,15 @@ class RealtimeWS:
         self.send_json({"type":"input_audio_buffer.commit"})
 
     def request_transcription(self):
-        """Ask server to create a transcription/response from buffered audio.
-        The exact control message required by the Realtime API may vary; this
-        prototype uses a generic response.create request that asks the model to
-        transcribe and reply.
-        """
-        self.send_json({"type":"response.create", "response": {"instructions":"Transcribe the audio and reply concisely as the assistant."}})
+        """Request transcription/assistant response from buffered audio; request text-only output to avoid unsupported 'response.audio' parameter."""
+        payload = {
+            "type": "response.create",
+            "response": {
+                "instructions": "Transcribe the audio and reply concisely as the assistant.",
+                "modalities": ["text"]
+            }
+        }
+        self.send_json(payload)
 
 def stream_from_misty(misty, ws_client, chunk_seconds=1, filename_prefix="rt_chunk"):
     idx = 0
@@ -196,7 +290,7 @@ def main():
         print("OpenAI API key required.")
         return
 
-    model = input("Realtime model (default gpt-5-realtime-preview): ").strip() or "gpt-5-realtime-preview"
+    model = input("Realtime model (default gpt-4o-realtime-preview): ").strip() or "gpt-4o-realtime-preview"
     ws = RealtimeWS(api_key, model=model)
     ws.connect()
 
