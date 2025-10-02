@@ -83,7 +83,11 @@ class RealtimeHandler:
         # Start WebSocket in background thread
         self.thread = threading.Thread(
             target=self.ws.run_forever,
-            kwargs={"ping_timeout": 10}
+            kwargs={
+                "ping_timeout": 10,
+                "ping_interval": 15,
+                "ping_payload": "keepalive"
+            }
         )
         self.thread.daemon = True
         self.thread.start()
@@ -107,24 +111,19 @@ class RealtimeHandler:
         """Configure the session for audio input/output."""
         self.logger.info("📋 Configuring Realtime API session...")
         
-        # Update session configuration
+        # Update session configuration (optimize for faster audio response)
         config_msg = {
             "type": "session.update",
             "session": {
+                # Keep both modalities but minimize server work by disabling server VAD
                 "modalities": ["text", "audio"],
                 "instructions": "You are a helpful assistant. Keep responses concise and friendly.",
-                "voice": "alloy",
+                "voice": "fable",
                 "input_audio_format": "pcm16",  # Expect PCM16 at 24kHz
                 "output_audio_format": "pcm16",  # Output PCM16 at 24kHz
-                "input_audio_transcription": {
-                    "model": "whisper-1"
-                },
-                "turn_detection": {
-                    "type": "server_vad",
-                    "threshold": 0.3,  # Lower threshold = more sensitive to speech
-                    "prefix_padding_ms": 500,  # More padding before speech
-                    "silence_duration_ms": 1500  # Wait 1.5s of silence before ending turn
-                }
+                # Disable server-side transcription and VAD; we explicitly commit and request
+                "input_audio_transcription": None,
+                "turn_detection": None
             }
         }
         
@@ -296,41 +295,80 @@ class RealtimeHandler:
                 self.logger.error(f"Error in audio callback: {e}")
     
     def _wav_to_pcm16(self, wav_bytes: bytes) -> bytes:
-        """Convert WAV audio to PCM16 format.
+        """Convert WAV audio to PCM16 mono at 24kHz without audioop.
         
-        Args:
-            wav_bytes: WAV format audio bytes
-            
-        Returns:
-            PCM16 audio bytes
+        - If 16-bit mono 24kHz: return as-is
+        - If stereo: average channels
+        - If sample rate != 24kHz: naive linear resample (good enough for speech)
         """
         import wave
+        import array
         
-        # Create a wave file object from bytes
-        wav_file = wave.open(io.BytesIO(wav_bytes), 'rb')
+        f = wave.open(io.BytesIO(wav_bytes), 'rb')
+        channels = f.getnchannels()
+        sampwidth = f.getsampwidth()
+        sr = f.getframerate()
+        n = f.getnframes()
+        raw = f.readframes(n)
+        f.close()
         
-        # Get audio parameters
-        channels = wav_file.getnchannels()
-        sample_width = wav_file.getsampwidth()
-        framerate = wav_file.getframerate()
-        n_frames = wav_file.getnframes()
+        self.logger.debug(f"WAV info: {channels}ch, {sampwidth*8}bit, {sr}Hz, {n} frames")
         
-        self.logger.debug(f"WAV info: {channels}ch, {sample_width*8}bit, {framerate}Hz, {n_frames} frames")
+        # Ensure 16-bit little-endian samples array
+        if sampwidth != 2:
+            # Convert to 16-bit by simple scaling/truncation
+            # Build array of original width, then map to 16-bit
+            src = array.array('b' if sampwidth == 1 else 'h')
+            src.frombytes(raw)
+            # Normalize to float and re-quantize to int16
+            if sampwidth == 1:
+                # 8-bit unsigned to int16
+                floats = [(x - 128) / 128.0 for x in src]
+            else:
+                maxv = float(2 ** (8 * sampwidth - 1) - 1)
+                floats = [max(-1.0, min(1.0, x / maxv)) for x in src]
+            int16 = array.array('h', [int(max(-32768, min(32767, v * 32767))) for v in floats])
+            sampwidth = 2
+        else:
+            int16 = array.array('h')
+            int16.frombytes(raw)
         
-        # Read all PCM data
-        pcm_data = wav_file.readframes(n_frames)
-        wav_file.close()
+        # Deinterleave if stereo and downmix to mono by averaging
+        if channels == 2:
+            left = int16[0::2]
+            right = int16[1::2]
+            mono = array.array('h', [(l + r) // 2 for l, r in zip(left, right)])
+        else:
+            mono = int16
         
-        # If mono and 16-bit, just return the PCM data
-        # Realtime API expects mono PCM16 at 24kHz
-        if channels == 1 and sample_width == 2:
-            # TODO: Resample to 24kHz if needed
-            return pcm_data
+        # Resample to 24kHz using linear interpolation if needed
+        target_sr = 24000
+        if sr != target_sr and len(mono) > 1:
+            import math
+            ratio = target_sr / float(sr)
+            out_len = int(math.floor(len(mono) * ratio))
+            resampled = array.array('h')
+            resampled.extend([0] * out_len)
+            for i in range(out_len):
+                # Map destination index to source position
+                src_pos = i / ratio
+                j = int(src_pos)
+                frac = src_pos - j
+                if j + 1 < len(mono):
+                    a = mono[j]
+                    b = mono[j + 1]
+                    val = int(a + (b - a) * frac)
+                else:
+                    val = mono[j]
+                # Clamp to int16
+                if val > 32767:
+                    val = 32767
+                elif val < -32768:
+                    val = -32768
+                resampled[i] = val
+            mono = resampled
         
-        # For other formats, we'd need to convert
-        # For now, just return the PCM data and hope it works
-        self.logger.warning(f"Audio format might not be optimal: {channels}ch, {sample_width*8}bit")
-        return pcm_data
+        return mono.tobytes()
     
     def send_audio(self, audio_bytes: bytes):
         """Send audio to the Realtime API for processing.
@@ -350,15 +388,21 @@ class RealtimeHandler:
             self.logger.error(f"Failed to convert audio: {e}")
             return
         
-        # Send audio as base64
-        b64_audio = base64.b64encode(pcm_data).decode("ascii")
-        msg = {
-            "type": "input_audio_buffer.append",
-            "audio": b64_audio
-        }
-        self._send_json(msg)
+        # Stream audio in chunks so server can start earlier
+        chunk_size = 4800 * 2  # 4800 samples (~200ms at 24kHz) * 2 bytes
+        total = len(pcm_data)
+        sent = 0
+        while sent < total:
+            chunk = pcm_data[sent:sent+chunk_size]
+            b64_audio = base64.b64encode(chunk).decode("ascii")
+            msg = {
+                "type": "input_audio_buffer.append",
+                "audio": b64_audio
+            }
+            self._send_json(msg)
+            sent += len(chunk)
         
-        self.logger.info(f"📤 Sent PCM audio: {len(pcm_data)} bytes ({len(b64_audio)} base64 chars)")
+        self.logger.info(f"📤 Sent PCM audio in chunks: {total} bytes total")
     
     def commit_audio(self):
         """Commit buffered audio for processing."""
