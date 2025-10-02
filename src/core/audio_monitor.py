@@ -48,6 +48,7 @@ class AudioMonitor:
         self.logger = logging.getLogger("AudioMonitor")
         
         self.running = False
+        self.paused = False
         self.wake_word_event_name = "WakeWordEvent"
         self.voice_record_event_name = "VoiceRecordEvent"
         
@@ -195,6 +196,9 @@ class AudioMonitor:
             event_data: Event data from Misty's key phrase recognition
         """
         try:
+            if self.paused:
+                self.logger.debug("Wake word event ignored (audio monitor paused)")
+                return
             self.logger.debug(f"Wake word event received: {event_data}")
             
             # Extract wake word information
@@ -227,6 +231,9 @@ class AudioMonitor:
             event_data: Event data from Misty's voice recording
         """
         try:
+            if self.paused:
+                self.logger.debug("Voice record event ignored (audio monitor paused)")
+                return
             self.logger.debug(f"Voice record event received: {event_data}")
             
             # Extract voice recording information
@@ -305,6 +312,9 @@ class AudioMonitor:
         if not self.running:
             self.logger.warning("Cannot capture speech - audio monitor not running")
             return
+        if self.paused:
+            self.logger.debug("Direct speech capture requested but audio monitor is paused; ignoring")
+            return
         
         try:
             self.logger.info("🎤 Starting direct speech capture (no wake word required)...")
@@ -334,8 +344,25 @@ class AudioMonitor:
         """
         return {
             "running": self.running,
+            "paused": self.paused,
             "mode": self.wake_word_mode,
             "silence_timeout_ms": self.silence_timeout,
             "max_speech_length_ms": self.max_speech_length
         }
+
+    def pause(self):
+        """Pause audio monitoring temporarily (ignore events)."""
+        if not self.running:
+            self.logger.debug("Audio monitor not running; pause ignored")
+            return
+        self.paused = True
+        self.logger.info("⏸️  Audio monitoring paused")
+
+    def resume(self):
+        """Resume audio monitoring after a pause."""
+        if not self.running:
+            self.logger.debug("Audio monitor not running; resume ignored")
+            return
+        self.paused = False
+        self.logger.info("▶️  Audio monitoring resumed")
 

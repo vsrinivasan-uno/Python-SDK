@@ -423,8 +423,29 @@ class RealtimeHandler:
         Args:
             audio_bytes: Audio data to process (WAV format)
         """
+        # 1) Append audio buffer
         self.send_audio(audio_bytes)
-        # Note: No need to commit or request response manually
-        # The session VAD will handle end-of-speech detection automatically
-        self.logger.info("🎤 Audio sent - waiting for server VAD to detect speech...")
+
+        # 2) Commit buffer so the server knows input has ended
+        #    This ensures a response is generated reliably across server configs
+        try:
+            self.commit_audio()
+        except Exception as e:
+            self.logger.error(f"Failed to commit audio buffer: {e}")
+            return
+
+        # 3) Explicitly request a response (text + audio)
+        #    Even with server VAD enabled, requesting a response is the most
+        #    reliable trigger for output across model versions.
+        try:
+            self.request_response(
+                instructions=(
+                    "Reply as a friendly assistant. Be concise and natural."
+                )
+            )
+        except Exception as e:
+            self.logger.error(f"Failed to request response: {e}")
+            return
+
+        self.logger.info("🎤 Audio sent, committed, and response requested - awaiting output...")
 

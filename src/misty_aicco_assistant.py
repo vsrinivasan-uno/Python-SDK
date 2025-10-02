@@ -69,6 +69,7 @@ class MistyAiccoAssistant:
         # Conversation mode state
         self.conversation_active = False
         self.conversation_timer: Optional[threading.Timer] = None
+        self.speaking_lock = False
         
         # Battery saving state
         self.services_stopped = False
@@ -285,6 +286,10 @@ class MistyAiccoAssistant:
         Args:
             face_data: Dictionary containing face information
         """
+        # Ignore face recognition while speaking
+        if getattr(self, "speaking_lock", False):
+            self.logger.debug("Ignoring face recognition during speaking")
+            return
         name = face_data.get("name", "Unknown")
         confidence = face_data.get("confidence", 0.0)
         
@@ -677,107 +682,161 @@ class MistyAiccoAssistant:
         Args:
             filename: Filename of audio on Misty
         """
+        # Enter speaking state: lock and pause audio monitor
+        self._enter_speaking_state()
         try:
             # Set LED to speaking state
             self.misty.change_led(*self.config.led.speaking)
-            
             self.logger.info(f"🔊 Playing realtime audio: {filename}")
             
-            # Play the audio
-            play_response = self.misty.play_audio(
-                fileName=filename,
-                volume=100
-            )
-            
+            play_response = self.misty.play_audio(fileName=filename, volume=100)
             if play_response.status_code == 200:
                 self.logger.info("✅ Audio playback started")
-                
-                # Wait a moment for playback (estimate)
-                import time
-                time.sleep(3)  # Adjust based on typical response length
-                
+                self._wait_for_audio_play_complete()
             else:
                 self.logger.warning(f"Play audio returned status {play_response.status_code}")
-            
         except Exception as e:
             self.logger.error(f"❌ Failed to play audio: {e}")
-        
         finally:
-            # Return LED to idle state
-            try:
-                self.misty.change_led(*self.config.led.idle)
-                self.logger.debug(f"💡 LED returned to idle")
-            except Exception as e:
-                self.logger.warning(f"Failed to reset LED: {e}")
-            
-            self.logger.info("✅ Realtime conversation complete! Ready for next wake word.")
+            self._exit_speaking_state_after_playback()
+            self.logger.info("✅ Realtime response complete!")
     
     def _speak_response(self, text: str):
-        """Speak AI response using Misty's TTS and return to idle.
-        
-        Args:
-            text: Text to speak
-        """
-        try:
-            # Set LED to speaking state (yellow-green)
-            self.misty.change_led(*self.config.led.speaking)
-            self.logger.debug(f"💡 LED set to speaking: RGB{self.config.led.speaking}")
-        except Exception as e:
-            self.logger.warning(f"Failed to change LED: {e}")
-        
-        # Play speaking animation
-        if self.personality_manager and self.config.personality.animations_during_speech:
-            self.personality_manager.speaking_animation()
-        
-        self.logger.info(f"🔊 Speaking: '{text}'")
+        """Speak AI response using Misty's TTS and handle conversation/idle after completion."""
+        # Enter speaking state: lock and pause audio monitor
+        self._enter_speaking_state()
         
         try:
-            # Speak the response
-            response = self.misty.speak(text=text, flush=True)
-            
-            if response.status_code == 200:
-                self.logger.info("✅ Speech playback started")
-            else:
-                self.logger.warning(f"Speak command returned status {response.status_code}")
-        
-        except Exception as e:
-            self.logger.error(f"❌ Failed to speak response: {e}")
-        
-        # Note: In a more advanced implementation, we could wait for 
-        # TextToSpeechComplete event before returning to idle.
-        # For now, we'll wait a brief moment based on text length.
-        import time
-        estimated_duration = len(text) * 0.05  # ~0.05 seconds per character
-        time.sleep(min(estimated_duration, 10))  # Cap at 10 seconds
-        
-        # Check if conversation mode is enabled
-        if self.config.voice_assistant.conversation_mode and self.conversation_active:
-            # Continue conversation - keep listening
-            self.logger.info("💬 Conversation mode active - listening for follow-up...")
-            self._start_conversation_timer()
-            # LED stays in listening mode
             try:
-                self.misty.change_led(*self.config.led.listening)  # Purple - waiting for follow-up
-                self.logger.debug(f"💡 LED set to listening (waiting for follow-up)")
+                self.misty.change_led(*self.config.led.speaking)
+                self.logger.debug(f"💡 LED set to speaking: RGB{self.config.led.speaking}")
             except Exception as e:
                 self.logger.warning(f"Failed to change LED: {e}")
             
-            # Start direct speech capture (no wake word required)
+            if self.personality_manager and self.config.personality.animations_during_speech:
+                self.personality_manager.speaking_animation()
+            
+            self.logger.info(f"🔊 Speaking: '{text}'")
+            self._speak_and_wait_for_tts_complete(text)
+        except Exception as e:
+            self.logger.error(f"❌ Failed during TTS: {e}")
+        finally:
+            self._exit_speaking_state_after_playback()
+
+    def _enter_speaking_state(self):
+        """Enter speaking state: set lock and pause audio monitor."""
+        self.speaking_lock = True
+        if self.audio_monitor:
+            try:
+                self.audio_monitor.pause()
+            except Exception:
+                pass
+
+    def _exit_speaking_state_after_playback(self):
+        """Exit speaking state and transition to conversation follow-up or idle."""
+        # Conversation mode follow-ups
+        if self.config.voice_assistant.conversation_mode and self.conversation_active:
+            self.logger.info("💬 Conversation mode active - listening for follow-up...")
+            self._start_conversation_timer()
+            try:
+                self.misty.change_led(*self.config.led.listening)
+                self.logger.debug("💡 LED set to listening (waiting for follow-up)")
+            except Exception as e:
+                self.logger.warning(f"Failed to change LED: {e}")
             if self.audio_monitor:
-                self.audio_monitor.capture_speech_without_wake_word()
+                try:
+                    self.audio_monitor.resume()
+                    self.audio_monitor.capture_speech_without_wake_word()
+                except Exception:
+                    pass
         else:
-            # Return LED to idle state and restart wake word detection
+            # Return to idle and wake word mode
             try:
                 self.misty.change_led(*self.config.led.idle)
                 self.logger.debug(f"💡 LED returned to idle: RGB{self.config.led.idle}")
             except Exception as e:
                 self.logger.warning(f"Failed to reset LED: {e}")
-            
-            # Restart wake word detection for next "Hey Misty"
             if self.audio_monitor:
-                self.audio_monitor.restart_wake_word_detection()
+                try:
+                    self.audio_monitor.resume()
+                    self.audio_monitor.restart_wake_word_detection()
+                except Exception:
+                    pass
+        self.speaking_lock = False
+
+    def _wait_for_audio_play_complete(self, timeout_seconds: float = 30.0):
+        """Block until AudioPlayComplete event arrives or timeout."""
+        import time
+        from mistyPy.Events import Events
+        event_name = "AudioPlayCompleteEvent"
+        done_flag = {"done": False}
         
-        self.logger.info("✅ Response complete!")
+        def _handler(_):
+            done_flag["done"] = True
+        
+        try:
+            self.misty.register_event(
+                event_type=Events.AudioPlayComplete,
+                event_name=event_name,
+                keep_alive=False,
+                callback_function=lambda data: _handler(data)
+            )
+        except Exception as e:
+            self.logger.warning(f"Failed to register AudioPlayComplete: {e}")
+            time.sleep(2)
+            return
+        
+        start = time.time()
+        while not done_flag["done"] and (time.time() - start) < timeout_seconds:
+            time.sleep(0.05)
+        try:
+            self.misty.unregister_event(event_name)
+        except Exception:
+            pass
+
+    def _speak_and_wait_for_tts_complete(self, text: str, timeout_seconds: float = 30.0):
+        """Speak text and wait for TextToSpeechComplete event or timeout."""
+        import time
+        from mistyPy.Events import Events
+        event_name = "TextToSpeechCompleteEvent"
+        done_flag = {"done": False}
+        
+        def _handler(_):
+            done_flag["done"] = True
+        
+        # Register completion event first
+        try:
+            self.misty.register_event(
+                event_type=Events.TextToSpeechComplete,
+                event_name=event_name,
+                keep_alive=False,
+                callback_function=lambda data: _handler(data)
+            )
+        except Exception as e:
+            self.logger.warning(f"Failed to register TextToSpeechComplete: {e}")
+        
+        # Speak
+        try:
+            response = self.misty.speak(text=text, flush=True)
+            if response.status_code == 200:
+                self.logger.info("✅ Speech playback started")
+            else:
+                self.logger.warning(f"Speak command returned status {response.status_code}")
+        except Exception as e:
+            self.logger.error(f"❌ Failed to speak response: {e}")
+            try:
+                self.misty.unregister_event(event_name)
+            except Exception:
+                pass
+            return
+        
+        start = time.time()
+        while not done_flag["done"] and (time.time() - start) < timeout_seconds:
+            time.sleep(0.05)
+        try:
+            self.misty.unregister_event(event_name)
+        except Exception:
+            pass
     
     def _start_conversation(self):
         """Start a new conversation session."""
