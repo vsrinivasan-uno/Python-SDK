@@ -20,6 +20,7 @@ import sys
 import signal
 import logging
 import threading
+import time
 from typing import Optional
 
 # Add project root to path for mistyPy access
@@ -301,11 +302,18 @@ class MistyAiccoAssistant:
         
         # Task 2.2: Greet person with cooldown management
         if self.greeting_manager:
-            # Play greeting animation
-            if self.personality_manager and self.config.personality.animations_during_speech:
-                self.personality_manager.greeting_animation()
+            # Request greeting immediately to minimize latency
+            import time
+            recognized_at = time.time()
+            self.greeting_manager.greet_person(name, recognized_at=recognized_at)
             
-            self.greeting_manager.greet_person(name)
+            # Run greeting animation asynchronously so it doesn't delay TTS
+            if self.personality_manager and self.config.personality.animations_during_speech:
+                try:
+                    threading.Thread(target=self.personality_manager.greeting_animation, daemon=True).start()
+                except Exception:
+                    # Non-fatal if animation thread fails
+                    pass
     
     def _initialize_voice_assistant(self):
         """Initialize voice assistant module.
@@ -529,9 +537,17 @@ class MistyAiccoAssistant:
             return
         
         if not self.realtime_handler.connected:
-            self.logger.error("Realtime API not connected")
-            self._speak_and_reset("Sorry, I'm not connected to the voice service.")
-            return
+            # Try a single reconnect attempt before failing to give the realtime
+            # handler a chance to recover from transient network issues.
+            self.logger.warning("Realtime API not connected - attempting reconnect...")
+            try:
+                self.realtime_handler.connect()
+            except Exception as e:
+                self.logger.error(f"Realtime reconnect failed: {e}")
+            if not self.realtime_handler.connected:
+                self.logger.error("Realtime API not connected")
+                self._speak_and_reset("Sorry, I'm not connected to the voice service.")
+                return
         
         # Get audio from Misty (with retry for 503 errors)
         self.logger.info("🔄 Retrieving audio from Misty...")
@@ -621,15 +637,41 @@ class MistyAiccoAssistant:
             temp_filename = f"realtime_response_{uuid.uuid4().hex[:8]}.wav"
             
             # Convert PCM16 to WAV by adding WAV header
-            # Realtime API sends PCM16 at 24kHz mono
-            sample_rate = 24000
+            # Optimize: Downsample from 24kHz to 16kHz for faster upload (speech quality is sufficient)
+            original_sample_rate = 24000
+            target_sample_rate = 16000
             num_channels = 1
             bits_per_sample = 16
-            byte_rate = sample_rate * num_channels * bits_per_sample // 8
-            block_align = num_channels * bits_per_sample // 8
-            data_size = len(audio_bytes)
             
-            # Build WAV header
+            # Downsample audio data from 24kHz to 16kHz using linear interpolation
+            import array
+            samples_24k = array.array('h')
+            samples_24k.frombytes(audio_bytes)
+            
+            # Simple downsampling by linear interpolation
+            ratio = target_sample_rate / original_sample_rate  # 16000/24000 = 0.6667
+            out_len = int(len(samples_24k) * ratio)
+            samples_16k = array.array('h', [0] * out_len)
+            
+            for i in range(out_len):
+                src_pos = i / ratio
+                j = int(src_pos)
+                frac = src_pos - j
+                if j + 1 < len(samples_24k):
+                    a = samples_24k[j]
+                    b = samples_24k[j + 1]
+                    val = int(a + (b - a) * frac)
+                else:
+                    val = samples_24k[j] if j < len(samples_24k) else 0
+                samples_16k[i] = max(-32768, min(32767, val))
+            
+            downsampled_bytes = samples_16k.tobytes()
+            data_size = len(downsampled_bytes)
+            
+            byte_rate = target_sample_rate * num_channels * bits_per_sample // 8
+            block_align = num_channels * bits_per_sample // 8
+            
+            # Build WAV header for 16kHz audio
             wav_header = struct.pack('<4sI4s4sIHHIIHH4sI',
                 b'RIFF',
                 36 + data_size,  # File size - 8
@@ -638,7 +680,7 @@ class MistyAiccoAssistant:
                 16,  # fmt chunk size
                 1,   # PCM format
                 num_channels,
-                sample_rate,
+                target_sample_rate,
                 byte_rate,
                 block_align,
                 bits_per_sample,
@@ -646,25 +688,30 @@ class MistyAiccoAssistant:
                 data_size
             )
             
-            # Combine header and data
-            wav_bytes = wav_header + audio_bytes
+            # Combine header and downsampled data
+            wav_bytes = wav_header + downsampled_bytes
+            
+            self.logger.info(f"🔽 Downsampled audio: {original_sample_rate}Hz -> {target_sample_rate}Hz ({len(audio_bytes)} -> {len(downsampled_bytes)} bytes, {100 - int(100*len(downsampled_bytes)/len(audio_bytes))}% smaller)")
             
             self.logger.info(f"✅ Converted PCM to WAV: {len(wav_bytes)} bytes total")
             
             # Convert WAV bytes to base64 string (required by Misty API)
             audio_base64 = base64.b64encode(wav_bytes).decode('utf-8')
+            base64_size_mb = len(audio_base64) / (1024 * 1024)
             
-            # Upload to Misty
-            self.logger.info("📤 Uploading audio to Misty...")
+            # Upload to Misty with timing
+            self.logger.info(f"📤 Uploading audio to Misty... ({base64_size_mb:.2f} MB base64)")
+            upload_start = time.time()
             upload_response = self.misty.save_audio(
                 fileName=temp_filename,
                 data=audio_base64,
                 immediatelyApply=False,
                 overwriteExisting=True
             )
+            upload_duration = time.time() - upload_start
             
             if upload_response.status_code == 200:
-                self.logger.info(f"✅ Audio uploaded: {temp_filename}")
+                self.logger.info(f"✅ Audio uploaded: {temp_filename} (took {upload_duration:.2f}s)")
                 
                 # Play the audio
                 self._play_realtime_audio(temp_filename)

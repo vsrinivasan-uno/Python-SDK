@@ -92,7 +92,7 @@ class GreetingManager:
         
         return greeting
     
-    def greet_person(self, person_name: str, force: bool = False) -> bool:
+    def greet_person(self, person_name: str, force: bool = False, recognized_at: Optional[float] = None) -> bool:
         """Greet a person with personalized message and LED animation.
         
         Args:
@@ -123,6 +123,11 @@ class GreetingManager:
             
             # Speak the greeting
             try:
+                # Log latency from face recognized to speak command, if provided
+                if recognized_at is not None:
+                    now = time.time()
+                    latency = now - recognized_at
+                    self.logger.info(f"⏱️ Face→speak latency: {latency:.3f}s")
                 response = self.misty.speak(text=greeting_message, flush=True)
                 if response.status_code == 200:
                     self.logger.info("🔊 Greeting spoken successfully")

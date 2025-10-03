@@ -38,6 +38,18 @@ class FaceRecognitionManager:
         self.camera_active_color = camera_active_color  # RGB color when camera is on
         
         self.logger.info("Face Recognition Manager initialized")
+        # Debounce / consecutive detection config
+        # Require this many consecutive detections within `detection_window_seconds`
+        # Default 1 to preserve existing behavior for tests; increase to 2+ to reduce false positives.
+        self.consecutive_required = 1
+        self.detection_window_seconds = 1.0
+        # Minimum time between triggering the external callback for the same face
+        self.min_trigger_interval_seconds = 1.0
+
+        # Internal detection tracking: label -> {count, first_seen, last_seen}
+        self._detection_history = {}
+        # Last time we triggered on_face_recognized for a given label
+        self._last_triggered = {}
     
     def start(self):
         """Start continuous face recognition monitoring.
@@ -220,22 +232,52 @@ class FaceRecognitionManager:
                 return
             
             # Log recognized face
-            self.logger.info(f"👤 Face recognized: '{face_label}' (confidence: {confidence:.2f})")
-            
-            # Prepare face data for callback
-            face_data = {
-                "name": face_label,
-                "confidence": confidence,
-                "timestamp": time.time(),
-                "raw_event": message
-            }
-            
-            # Call external callback if provided
-            if self.on_face_recognized:
-                try:
-                    self.on_face_recognized(face_data)
-                except Exception as e:
-                    self.logger.error(f"Error in face recognition callback: {e}", exc_info=True)
+            self.logger.debug(f"Raw detection: '{face_label}' (confidence: {confidence:.2f})")
+
+            now = time.time()
+
+            # Update detection history
+            hist = self._detection_history.get(face_label)
+            if hist is None:
+                hist = {"count": 1, "first_seen": now, "last_seen": now}
+            else:
+                # If last seen is within the window, increment count, otherwise reset
+                if now - hist["last_seen"] <= self.detection_window_seconds:
+                    hist["count"] += 1
+                else:
+                    hist["count"] = 1
+                    hist["first_seen"] = now
+                hist["last_seen"] = now
+            self._detection_history[face_label] = hist
+
+            # Check if we have enough consecutive detections to trigger
+            if hist["count"] >= self.consecutive_required:
+                # Respect minimum trigger interval for same label
+                last_trig = self._last_triggered.get(face_label, 0)
+                if now - last_trig >= self.min_trigger_interval_seconds:
+                    self.logger.info(f"👤 Face recognized: '{face_label}' (confidence: {confidence:.2f}) - consecutive={hist['count']}")
+                    face_data = {
+                        "name": face_label,
+                        "confidence": confidence,
+                        "timestamp": now,
+                        "raw_event": message
+                    }
+                    # Call external callback if provided
+                    if self.on_face_recognized:
+                        try:
+                            self.on_face_recognized(face_data)
+                            self._last_triggered[face_label] = now
+                        except Exception as e:
+                            self.logger.error(f"Error in face recognition callback: {e}", exc_info=True)
+                    # Reset count so we don't immediately trigger again
+                    hist["count"] = 0
+                    hist["first_seen"] = now
+                    hist["last_seen"] = now
+                    self._detection_history[face_label] = hist
+                else:
+                    self.logger.debug(f"Skipping trigger for '{face_label}' - min_trigger_interval not elapsed")
+            else:
+                self.logger.debug(f"Waiting for consecutive detections for '{face_label}' ({hist['count']}/{self.consecutive_required})")
             
         except Exception as e:
             self.logger.error(f"Error processing face recognition event: {e}", exc_info=True)

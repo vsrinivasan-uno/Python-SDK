@@ -1,4 +1,4 @@
-from requests import request, Response
+from requests import request, Response, Session
 from datetime import datetime
 from collections import namedtuple
 
@@ -8,10 +8,23 @@ GridCell = namedtuple('GridCell', ['x', 'y'])
 class RobotCommands:
     def __init__(self, ip: str = "127.0.0.1"):
         self.ip = ip
+        # Use a persistent session for connection pooling and faster requests
+        self._session = Session()
+        # Configure session for better performance
+        self._session.headers.update({
+            'Connection': 'keep-alive',
+            'Accept-Encoding': 'gzip, deflate'
+        })
+        # Default timeout for all requests (connect timeout, read timeout)
+        self._timeout = (5, 30)  # 5s connect, 30s read
 
     def _generic_request(self, verb: str, endpoint: str, **kwargs):
         url = "http://" + self.ip + "/api/" + endpoint
-        return request(verb, url, **kwargs)
+        # Add timeout if not already specified
+        if 'timeout' not in kwargs:
+            kwargs['timeout'] = self._timeout
+        # Use session for connection pooling
+        return self._session.request(verb, url, **kwargs)
 
     def get_request(self, endpoint: str, **kwargs):
         return self._generic_request("get", endpoint, **kwargs)
@@ -1000,7 +1013,9 @@ class RobotCommands:
             "overwriteExisting": overwriteExisting
         }
 
-        return self.post_request("audio", json=json)
+        # Use much longer timeout for audio uploads (can be large base64 data)
+        # 60s send timeout, 120s read timeout (robot network can be slow)
+        return self.post_request("audio", json=json, timeout=(60, 120))
 
     def save_image(self,
                    fileName: str = None,

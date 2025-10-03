@@ -37,7 +37,8 @@ from requests import exceptions
 
 class Robot(RobotCommands):
     def __init__(self, ip='127.0.0.1'):
-        self.ip = ip
+        # Call parent constructor to initialize session, timeout, etc.
+        super().__init__(ip)
         self.active_event_registrations = {}
 
     def register_event(self, event_type, event_name="", condition=None, debounce=0, keep_alive=False, callback_function=None):

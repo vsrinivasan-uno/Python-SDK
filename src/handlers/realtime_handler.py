@@ -18,6 +18,7 @@ import logging
 import io
 from typing import Optional, Callable
 import websocket
+from collections import deque
 
 
 class RealtimeHandler:
@@ -32,7 +33,9 @@ class RealtimeHandler:
         api_key: str,
         model: str = "gpt-4o-realtime-preview-2024-10-01",
         on_transcript_received: Optional[Callable[[str], None]] = None,
-        on_audio_received: Optional[Callable[[bytes], None]] = None
+        on_audio_received: Optional[Callable[[bytes], None]] = None,
+        chunk_ms: int = 100,
+        use_audioop: bool = True,
     ):
         """Initialize the Realtime API handler.
         
@@ -56,6 +59,18 @@ class RealtimeHandler:
         # Buffers for assembling streaming responses
         self.audio_buffers = {}  # response_id -> bytearray
         self.transcript_buffers = {}  # response_id -> str
+        # Streaming configuration: how many milliseconds per chunk (smaller -> faster time-to-first-byte)
+        # Default 100ms -> at 24kHz samples_per_ms = 24 -> 2400 samples -> 4800 bytes
+        self.chunk_ms = int(chunk_ms)
+        self.use_audioop = bool(use_audioop)
+        # Outgoing send queue for reliable delivery
+        self.send_queue = deque()  # items: (payload_dict, attempt_count, next_try_ts)
+        self.send_lock = threading.Lock()
+        self.sender_thread: Optional[threading.Thread] = None
+        self.paused_until = 0.0  # timestamp until which sending is paused (rate limits)
+        self.max_send_retries = 5
+        # Start sender background thread
+        self._start_sender_thread()
         
     def connect(self):
         """Connect to the OpenAI Realtime API."""
@@ -106,6 +121,24 @@ class RealtimeHandler:
         
         # Configure the session for audio input/output
         self._configure_session()
+
+    def _start_sender_thread(self):
+        """Start background thread that drains the send queue."""
+        if self.sender_thread and self.sender_thread.is_alive():
+            return
+
+        def _loop():
+            self.logger.debug("Sender thread started")
+            while True:
+                try:
+                    self._sender_loop()
+                except Exception as e:
+                    # Keep sender thread alive on unexpected errors
+                    self.logger.error(f"Sender thread error: {e}", exc_info=True)
+                    time.sleep(1)
+
+        self.sender_thread = threading.Thread(target=_loop, daemon=True)
+        self.sender_thread.start()
     
     def _configure_session(self):
         """Configure the session for audio input/output."""
@@ -118,7 +151,7 @@ class RealtimeHandler:
                 # Keep both modalities but minimize server work by disabling server VAD
                 "modalities": ["text", "audio"],
                 "instructions": "You are a helpful assistant. Keep responses concise and friendly.",
-                "voice": "fable",
+                "voice": "sage",
                 "input_audio_format": "pcm16",  # Expect PCM16 at 24kHz
                 "output_audio_format": "pcm16",  # Output PCM16 at 24kHz
                 # Disable server-side transcription and VAD; we explicitly commit and request
@@ -156,6 +189,17 @@ class RealtimeHandler:
         Note: Supports both old and new websocket-client API versions.
         """
         self.logger.error(f"Realtime WebSocket error: {error}")
+        # If socket-level broken pipe / connection issues, attempt reconnect
+        try:
+            err_str = str(error or "")
+            if "Broken pipe" in err_str or "[Errno 32]" in err_str or isinstance(error, OSError):
+                self.logger.info("Detected broken pipe or OSError - scheduling reconnect")
+                # Mark as disconnected and schedule reconnect
+                self.connected = False
+                # Try reconnect asynchronously (non-blocking)
+                threading.Thread(target=self._attempt_reconnect_with_backoff, daemon=True).start()
+        except Exception:
+            pass
     
     def _on_message(self, ws, message):
         """Called when a message is received from the Realtime API.
@@ -181,6 +225,35 @@ class RealtimeHandler:
         # Debug: Log ALL event types to see what we're receiving
         self.logger.info(f"📨 Received event type: {event_type}")
         self.logger.debug(f"   Full event: {json.dumps(data, indent=2)[:500]}")
+
+        # Handle rate limit events specifically
+        if event_type == "rate_limits.updated":
+            # Pause outgoing sends until rate limit resets (if provided)
+            pause_secs = 0
+            # Common possible fields: retry_after (seconds), reset_after_ms
+            if isinstance(data.get("retry_after"), (int, float)):
+                pause_secs = int(data.get("retry_after"))
+            elif isinstance(data.get("reset_after_ms"), (int, float)):
+                pause_secs = int(data.get("reset_after_ms") / 1000.0)
+            else:
+                # try nested limits
+                limits = data.get("limits") or {}
+                if isinstance(limits, dict):
+                    # pick smallest reset hint available
+                    for k in ("reset_after_ms", "retry_after"):
+                        v = limits.get(k)
+                        if isinstance(v, (int, float)):
+                            if k.endswith("ms"):
+                                pause_secs = int(v / 1000.0)
+                            else:
+                                pause_secs = int(v)
+                            break
+
+            if pause_secs <= 0:
+                pause_secs = 60  # default 60s if unspecified
+
+            self.paused_until = time.time() + pause_secs
+            self.logger.warning(f"Rate limit updated - pausing sends for {pause_secs}s")
         
         # Extract response ID from various possible locations
         resp_id = self._extract_response_id(data)
@@ -295,7 +368,7 @@ class RealtimeHandler:
                 self.logger.error(f"Error in audio callback: {e}")
     
     def _wav_to_pcm16(self, wav_bytes: bytes) -> bytes:
-        """Convert WAV audio to PCM16 mono at 24kHz without audioop.
+        """Convert WAV audio to PCM16 mono at 24kHz.
         
         - If 16-bit mono 24kHz: return as-is
         - If stereo: average channels
@@ -303,6 +376,11 @@ class RealtimeHandler:
         """
         import wave
         import array
+        # Try to use audioop for faster conversions when available and allowed
+        try:
+            import audioop
+        except Exception:
+            audioop = None
         
         f = wave.open(io.BytesIO(wav_bytes), 'rb')
         channels = f.getnchannels()
@@ -314,6 +392,31 @@ class RealtimeHandler:
         
         self.logger.debug(f"WAV info: {channels}ch, {sampwidth*8}bit, {sr}Hz, {n} frames")
         
+        # Fast path using audioop when available and requested
+        if self.use_audioop and audioop is not None:
+            try:
+                # If input is already 16-bit, just ensure correct channels and rate
+                if sampwidth == 2:
+                    samples = raw
+                else:
+                    # Convert sample width to 2 (sampwidth param is bytes)
+                    samples = audioop.lin2lin(raw, sampwidth, 2)
+
+                # Downmix stereo to mono if needed
+                if channels == 2:
+                    samples = audioop.tomono(samples, 2, 0.5, 0.5)
+
+                # Resample to 24000 Hz if needed
+                target_sr = 24000
+                if sr != target_sr:
+                    samples = audioop.ratecv(samples, 2, 1, sr, target_sr, None)[0]
+
+                return samples
+            except Exception as e:
+                # Fall back to pure-Python implementation below
+                self.logger.debug(f"audioop fast path failed: {e}")
+
+        # Fallback pure-Python path (original behavior)
         # Ensure 16-bit little-endian samples array
         if sampwidth != 2:
             # Convert to 16-bit by simple scaling/truncation
@@ -388,8 +491,10 @@ class RealtimeHandler:
             self.logger.error(f"Failed to convert audio: {e}")
             return
         
-        # Stream audio in chunks so server can start earlier
-        chunk_size = 4800 * 2  # 4800 samples (~200ms at 24kHz) * 2 bytes
+        # Stream audio in chunks so server can start earlier. Chunk size derived from `chunk_ms`.
+        # samples_per_ms = 24 (24000 samples/sec -> 24 samples/ms)
+        samples_per_ms = 24
+        chunk_size = samples_per_ms * self.chunk_ms * 2  # samples * bytes_per_sample
         total = len(pcm_data)
         sent = 0
         while sent < total:
@@ -438,22 +543,100 @@ class RealtimeHandler:
     
     def _send_json(self, payload: dict):
         """Send JSON message to the WebSocket."""
-        if not self.ws:
-            self.logger.error("Cannot send JSON - WebSocket not initialized")
+        # Prefer enqueueing into the send queue and let background sender handle retries
+        try:
+            self._enqueue_json(payload)
+        except Exception as e:
+            self.logger.error(f"Failed to enqueue payload for sending: {e}", exc_info=True)
+
+    def _enqueue_json(self, payload: dict, attempt: int = 0, delay: float = 0.0):
+        """Add a payload to the send queue with optional initial delay."""
+        next_try = time.time() + float(delay)
+        with self.send_lock:
+            self.send_queue.append((payload, int(attempt), next_try))
+        # Ensure the sender thread is running
+        self._start_sender_thread()
+
+    def _sender_loop(self):
+        """Drain the send queue, sending messages with retries and honoring rate limits."""
+        # If not connected, wait briefly and retry
+        now = time.time()
+        if time.time() < self.paused_until:
+            # Respect rate limit pause
+            sleep_for = max(0.1, self.paused_until - time.time())
+            time.sleep(sleep_for)
             return
-        
-        if not self.connected:
-            self.logger.error("Cannot send JSON - not connected")
+
+        with self.send_lock:
+            if not self.send_queue:
+                # Nothing to do
+                time.sleep(0.05)
+                return
+            payload, attempt, next_try = self.send_queue.popleft()
+
+        if time.time() < next_try:
+            # Not yet time to try this item - requeue and back off
+            with self.send_lock:
+                self.send_queue.appendleft((payload, attempt, next_try))
+            time.sleep(0.05)
             return
-        
+
+        if not self.ws or not self.connected:
+            # If disconnected, requeue with backoff and attempt reconnect
+            backoff = min(60, (2 ** attempt))
+            self.logger.debug(f"Socket not connected, requeueing payload (attempt={attempt}) backoff={backoff}s")
+            with self.send_lock:
+                self.send_queue.append((payload, attempt + 1, time.time() + backoff))
+            # Trigger reconnect attempt asynchronously
+            threading.Thread(target=self._attempt_reconnect_with_backoff, daemon=True).start()
+            time.sleep(0.1)
+            return
+
+        # Try to send now
         try:
             msg = json.dumps(payload)
-            self.logger.debug(f"📤 Sending: {payload.get('type', 'unknown')} - {len(msg)} chars")
+            self.logger.debug(f"📤 Sending from queue: {payload.get('type', 'unknown')} - {len(msg)} chars")
             self.ws.send(msg)
-            self.logger.debug(f"✅ Sent successfully")
+            self.logger.debug("✅ Sent successfully from queue")
         except Exception as e:
-            self.logger.error(f"❌ Failed to send JSON: {e}")
-            self.logger.error(f"   Payload type: {payload.get('type', 'unknown')}")
+            self.logger.error(f"❌ Failed to send queued JSON: {e}")
+            # On failure, decide whether to retry
+            if attempt < self.max_send_retries:
+                backoff = min(60, (2 ** attempt))
+                with self.send_lock:
+                    self.send_queue.append((payload, attempt + 1, time.time() + backoff))
+                # If failure looks like connection issue, schedule reconnect
+                err_str = str(e)
+                if "Broken pipe" in err_str or "[Errno 32]" in err_str or isinstance(e, OSError):
+                    self.connected = False
+                    threading.Thread(target=self._attempt_reconnect_with_backoff, daemon=True).start()
+            else:
+                self.logger.error(f"Dropping payload after {attempt} attempts: {payload.get('type', 'unknown')}")
+
+    def _attempt_reconnect_with_backoff(self, max_attempts: int = 6):
+        """Attempt to reconnect with exponential backoff. Non-blocking caller."""
+        attempt = 0
+        while attempt < max_attempts and not self.connected:
+            wait = min(60, 2 ** attempt)
+            self.logger.info(f"Attempting Realtime API reconnect (attempt {attempt+1}) in {wait}s")
+            time.sleep(wait)
+            try:
+                # If ws exists, close it first
+                try:
+                    if self.ws:
+                        self.ws.close()
+                except Exception:
+                    pass
+                # Try to establish a fresh connection
+                self.connect()
+                if self.connected:
+                    self.logger.info("Reconnect successful")
+                    return True
+            except Exception as e:
+                self.logger.debug(f"Reconnect attempt {attempt+1} failed: {e}")
+            attempt += 1
+        self.logger.error("Failed to reconnect to Realtime API after multiple attempts")
+        return False
     
     def process_audio_file(self, audio_bytes: bytes):
         """Process a complete audio file through the Realtime API.
@@ -484,7 +667,179 @@ class RealtimeHandler:
         try:
             self.request_response(
                 instructions=(
-                    "Reply as a friendly assistant. Be concise and natural."
+                    """System Prompt for UNO AI Program Assistant
+You are an official virtual assistant for the University of Nebraska Omaha (UNO), specifically focused on providing information about UNO and its Bachelor of Science in Artificial Intelligence (BSAI) program.
+Your Role and Scope
+Your ONLY purpose is to discuss:
+
+University of Nebraska Omaha (UNO) - its campus, facilities, rankings, and general information
+The Bachelor of Science in Artificial Intelligence (BSAI) program offered by UNO
+The College of Information Science and Technology at UNO
+
+You must STRICTLY operate within the provided knowledge base below. You do NOT have information about:
+
+Other universities or their programs
+Other degree programs at UNO beyond what's mentioned in your knowledge base
+General AI topics, tutorials, or technical explanations unrelated to the BSAI program
+Current events, news, or information outside your knowledge base
+Personal advice unrelated to the UNO BSAI program
+
+Knowledge Base
+UNIVERSITY OF NEBRASKA OMAHA (UNO)
+Basic Information:
+
+Location: Omaha, Nebraska (41.259°N 96.006°W)
+Website: https://www.unomaha.edu/
+Type: Public Research University (R2: High research activity)
+Established: 1908
+Part of: University of Nebraska system
+Campus: 3 campuses (Dodge, Scott, Center), urban setting, 88 acres
+Student Enrollment: Approximately 9,910 full-time students
+
+Academic Structure:
+
+6 colleges offering 200+ degree programs
+Strong focus on Information Science, Technology, and Computer Science
+
+Rankings & Recognition:
+
+#1 public university in the US for veterans
+Affordable tuition among Nebraska's four-year institutions
+High employability focus for students
+
+Resources & Opportunities:
+
+Modern facilities for engineering, IT, business, and biomechanics
+Extensive partnerships with 1,000+ organizations for community engagement
+Service learning opportunities
+Internships and research centers
+AI-powered career development tools
+
+
+BACHELOR OF SCIENCE IN ARTIFICIAL INTELLIGENCE (BSAI)
+Program Details:
+
+College: College of Information Science and Technology
+Department: Computer Science
+Program Start: Spring 2025
+Distinction: First AI bachelor's program in Nebraska, one of few in the Midwest
+Catalog: https://catalog.unomaha.edu/undergraduate/college-information-science-technology/computer-science/ai-bs/#fouryearplantext
+
+Program Mission:
+
+Prepare graduates as AI specialists, leaders, and innovators
+Bridge theory and real-world industry applications
+Target students interested in machine learning, data science, generative AI, and ethical AI application
+Hands-on curriculum with emphasis on practical experience
+
+Curriculum Areas:
+
+Machine Learning
+Data Analysis and Mining
+Neural Networks & Deep Learning
+Natural Language Processing (NLP)
+Computer Vision
+Robotics & Autonomous Systems
+Algorithm Development
+AI Ethics and Society
+Interdisciplinary electives (business, psychology, philosophy)
+
+Special Features:
+
+Real-world project collaborations with Omaha tech sector
+Research opportunities at UNO AI Research Center
+Access to industry internships and community initiatives
+Student organizations for AI, tech, and professional development
+
+Career Outcomes:
+Graduates can pursue roles such as:
+
+AI Engineer
+Machine Learning Engineer
+Data Scientist
+Robotics Engineer
+NLP Specialist
+Computer Vision Engineer
+AI Research Scientist
+
+Job Market:
+
+AI jobs projected to grow over 30% in the next decade
+AI specialist jobs carry up to 25% wage premium in some markets
+
+Admission & Progression:
+
+Direct, standard application through UNO portal
+Open for new enrollment
+Pathways into accelerated Master's programs (5-year BS/MS)
+All backgrounds welcome
+Foundational primer courses available for students without prior computing experience
+
+Industry Connections:
+
+Partnerships with Omaha Chamber of Commerce
+Collaborations with local and national tech firms
+AI-powered career advising
+Immersive job training experiences
+
+
+CONTACT INFORMATION
+College of Information Science and Technology
+
+Phone: (402) 554-3819
+Email: istt@unomaha.edu
+Address: PKI 280, 1110 South 67th Street, Omaha, NE 68182
+
+Communication Style
+CRITICAL: Keep responses short, crisp, and conversational
+
+Write like you're having a natural conversation, not giving a presentation
+Use 2-4 sentences for most responses
+Break up longer information into digestible chunks
+Avoid walls of text and long paragraphs
+Don't list everything at once - share what's relevant to their question
+Use a friendly, casual tone while staying professional
+It's okay to follow up with "Want to know more about [specific topic]?" to keep it interactive
+
+Example of good response style:
+"The BSAI program starts Spring 2025 and it's actually the first AI bachelor's degree in Nebraska! You'll get hands-on experience with machine learning, NLP, computer vision, and more. What aspect interests you most?"
+Example of what to avoid:
+Long paragraphs listing every single detail about the curriculum, requirements, and career outcomes all at once.
+Response Guidelines
+When responding to questions within your scope:
+
+Be helpful and conversational
+Answer directly and concisely
+Share 1-3 key points, not everything at once
+Ask follow-up questions to keep the conversation flowing
+Use natural language, not formal/robotic phrasing
+Direct to contact info only when they need specific help (applications, detailed questions)
+
+When users ask questions OUTSIDE your scope:
+Keep it brief and friendly:
+
+"I'm focused on UNO's AI program specifically. What would you like to know about it?"
+"That's outside my wheelhouse! I'm here for questions about UNO and our BSAI degree. Anything I can help with there?"
+"I only cover UNO's AI bachelor's program. For other programs, check out unomaha.edu or call (402) 554-3819."
+
+Topics to redirect:
+
+Other universities → "I only know about UNO. You'd want to reach out to them directly!"
+Other degree programs → "I specialize in our AI program. For other UNO programs, visit unomaha.edu."
+General AI tutorials → "I'm here to discuss our academic program, not tech support. Want to know what AI topics we cover in class?"
+Specific admission cases → "Best to contact istt@unomaha.edu or call (402) 554-3819 for that!"
+
+Important Rules
+
+NEVER make up information not in your knowledge base
+NEVER discuss other universities or compare programs
+NEVER provide technical AI assistance or coding help
+NEVER give definitive admission decisions
+ALWAYS stay within the scope of UNO and the BSAI program
+ALWAYS keep responses short and conversational
+ALWAYS be honest when you don't have information
+
+Keep it natural, keep it brief, keep it helpful!RetryClaude can make mistakes. Please double-check responses."""
                 )
             )
         except Exception as e:

@@ -1003,6 +1003,16 @@ Misty Mic → Wake Word Detector → Voice Query Capture
   - User can switch between modes via config
   - All bugs fixed, system tested and stable!
 
+**October 3, 2025 - Face Greeting Latency Optimization (EXECUTOR MODE)**
+
+ - Implemented low-latency greeting flow: speak first, animate concurrently.
+ - Change details:
+   - `src/misty_aicco_assistant.py` → `_on_face_recognized()` now calls `greet_person(name, recognized_at=...)` immediately and starts `greeting_animation()` in a background thread.
+   - `src/core/greeting_manager.py` → `greet_person()` accepts `recognized_at` (optional) and logs precise Face→Speak latency (⏱️).
+ - Expected result: Removes ~1.8s delay caused by blocking animation before TTS.
+ - Verification: Check logs for "⏱️ Face→speak latency" right after a face recognition log; target < 0.3s typical.
+
+
 **Planning Summary**:
 The Planner has completed a comprehensive analysis of the Misty II Python SDK and created a detailed 10-phase implementation plan. The plan breaks down the complex voice-activated AI assistant with face recognition into 23 discrete, testable tasks across 10 phases.
 
@@ -2396,4 +2406,85 @@ CONVERSATION_TIMEOUT_SECONDS=10.0
 - Total latency: ~1-3 seconds (as designed!)
 - Audio format: PCM16 24kHz → WAV 24kHz mono
 - All bugs fixed, system should now play audio correctly!
+
+### October 3, 2025 - RealtimeHandler fixes (EXECUTOR MODE)
+
+- Changes implemented in `src/handlers/realtime_handler.py`:
+  - Added an outgoing **send queue** with retries and exponential backoff to ensure reliable delivery of JSON messages.
+  - Implemented a **background sender thread** that drains the queue, honors `rate_limits.updated` pauses, and retries failed sends.
+  - Added detection for socket-level errors (e.g. **Broken pipe** / `[Errno 32]`) and an **automatic reconnect** routine with exponential backoff.
+  - Queue items are dropped after configurable retries to avoid infinite loops; rate-limit events pause sending for a sensible default.
+
+- Status: Changes applied to codebase and `src/handlers/realtime_handler.py` lints checked (no linter errors reported).
+
+- Next verification steps:
+  1. Run the application in realtime mode and reproduce the previous `Broken pipe` error to verify automatic reconnection.
+  2. Force a `rate_limits.updated` event in logs (or simulate) to validate pause/resume behavior.
+  3. Observe logs for queued message retries and eventual delivery or drop after retries.
+
+### October 3, 2025 - Audio Upload Optimization (EXECUTOR MODE)
+
+**Problem Identified:**
+- Audio upload to Misty was taking 23 seconds (15:57:05 to 15:57:28 from logs)
+- Bottlenecks:
+  1. No HTTP timeout settings → requests could hang indefinitely
+  2. No connection pooling → new TCP connection for each request
+  3. Large audio files → 24kHz PCM audio uploaded as base64-encoded WAV
+
+**Optimizations Implemented:**
+
+1. **Connection Pooling & Keep-Alive** (`mistyPy/RobotCommands.py`):
+   - Added persistent `requests.Session` object for connection reuse
+   - Enabled HTTP keep-alive and gzip/deflate compression
+   - Added default timeout (5s connect, 30s read) to prevent hanging
+   - Expected improvement: 30-50% faster for subsequent requests
+
+2. **Audio Downsampling** (`src/misty_aicco_assistant.py`):
+   - Downsample audio from 24kHz → 16kHz before upload
+   - Uses linear interpolation for quality preservation
+   - 16kHz is sufficient for speech quality
+   - File size reduction: ~33% smaller (24→16 ratio)
+   - Expected improvement: 30-40% faster upload time
+
+**Files Modified:**
+- `mistyPy/RobotCommands.py` - Added Session, timeout, keep-alive
+- `src/misty_aicco_assistant.py` - Added audio downsampling in `_on_realtime_audio()`
+
+**Expected Results:**
+- Upload time should drop from ~23s to ~10-12s (50%+ improvement)
+- Better reliability with timeout handling
+- No quality degradation for speech (16kHz is standard for voice)
+
+**Testing Needed:**
+- Run assistant with realtime mode
+- Measure upload time in logs (look for "📤 Uploading audio" to "✅ Audio uploaded" timestamps)
+- Verify audio quality is acceptable at 16kHz
+- Confirm no timeout errors under normal operation
+
+**Bug Fix #1:**
+- Fixed `AttributeError: 'Robot' object has no attribute '_timeout'`
+- Issue: `Robot` class wasn't calling parent `RobotCommands.__init__()`, so session and timeout weren't initialized
+- Solution: Added `super().__init__(ip)` call in `mistyPy/Robot.py`
+- Status: ✅ Fixed
+
+**Bug Fix #2:**
+- Fixed `TimeoutError: timed out` during audio upload
+- Root Cause: Audio files are 1.2-1.6 MB (2.2 MB base64), robot network is SLOW
+  - Taking >5 seconds just to SEND the data (connect/send timeout)
+  - Original timeout was (5s connect, 30s read) - too short for send operation
+- Solution: Increased BOTH timeouts for `save_audio()`
+  - Changed from `timeout=(5, 30)` default
+  - Changed to `timeout=(60, 120)` for audio uploads
+  - 60s send timeout, 120s read timeout
+- Added logging: Shows file size (MB) and actual upload duration
+- Modified files:
+  - `mistyPy/RobotCommands.py` - `save_audio()` uses `timeout=(60, 120)`
+  - `src/misty_aicco_assistant.py` - Added size/duration logging
+- Status: ✅ Fixed
+
+**Bug Fix #3:**
+- Fixed `NameError: name 'time' is not defined`
+- Issue: Used `time.time()` without importing `time` module
+- Solution: Added `import time` to `src/misty_aicco_assistant.py`
+- Status: ✅ Fixed, ready to test
 
