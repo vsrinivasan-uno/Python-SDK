@@ -557,6 +557,17 @@ class MistyAiccoAssistant:
         self.greeting_manager = None
         self.personality_manager = None
         
+        # Simple photo mapping: person name -> image file path
+        self.person_photos = {
+            "Ashish": "photos/ashish.jpg",
+            "Vishva": "photos/vishva.png", 
+            "Jane Smith": "photos/jane_smith.png",
+            # Add more people here as needed
+        }
+        
+        # Track uploaded photos to avoid re-uploading
+        self.uploaded_photos = {}  # person_name -> misty_filename
+        
         # Conversation mode state
         self.conversation_active = False
         self.conversation_timer: Optional[threading.Timer] = None
@@ -762,6 +773,9 @@ class MistyAiccoAssistant:
             else:
                 self.logger.info("No faces trained yet. Train faces to enable greetings.")
             
+            # Preload all configured photos for faster display
+            self._preload_all_photos()
+            
             self.logger.info("✅ Face recognition initialized successfully")
             
         except Exception as e:
@@ -789,6 +803,9 @@ class MistyAiccoAssistant:
         # Record interaction (resets idle timer)
         if self.personality_manager:
             self.personality_manager.record_interaction()
+        
+        # Display person's photo if available in dictionary
+        self._display_person_photo(name)
         
         # Task 2.2: Greet person with cooldown management
         if self.greeting_manager:
@@ -1601,6 +1618,133 @@ class MistyAiccoAssistant:
         
         return False
     
+    def _display_person_photo(self, person_name: str):
+        """Display a person's photo on Misty's screen using simple dictionary lookup.
+        
+        Args:
+            person_name: Name of the person as recognized by face recognition
+        """
+        try:
+            # Check if we have a photo for this person in our dictionary
+            if person_name not in self.person_photos:
+                self.logger.debug(f"No photo configured for {person_name}")
+                return
+            
+            photo_path = self.person_photos[person_name]
+            self.logger.info(f"📸 Found photo for {person_name}: {photo_path}")
+            
+            # Check if photo is already uploaded to Misty
+            if person_name not in self.uploaded_photos:
+                # Upload photo to Misty
+                if self._upload_person_photo(person_name, photo_path):
+                    self.logger.info(f"✅ Photo uploaded for {person_name}")
+                else:
+                    self.logger.warning(f"❌ Failed to upload photo for {person_name}")
+                    return
+            
+            # Display the photo
+            misty_filename = self.uploaded_photos[person_name]
+            self.logger.info(f"🖼️  Displaying photo: {misty_filename}")
+            
+            response = self.misty.display_image(
+                fileName=misty_filename,
+                alpha=1.0,  # Fully opaque
+                layer="default"
+            )
+            
+            if response.status_code == 200:
+                self.logger.info(f"✅ Photo displayed for {person_name}")
+                
+                # Set timer to return to default expression after 3 seconds
+                def return_to_default():
+                    try:
+                        self.misty.display_image(
+                            fileName="e_DefaultContent.jpg",  # Default Misty eyes
+                            alpha=1.0,
+                            layer="default"
+                        )
+                        self.logger.debug("🔄 Returned to default eye expression")
+                    except Exception as e:
+                        self.logger.warning(f"Failed to return to default expression: {e}")
+                
+                # Schedule return to default after 3 seconds
+                timer = threading.Timer(3.0, return_to_default)
+                timer.daemon = True
+                timer.start()
+                
+            else:
+                self.logger.error(f"❌ Failed to display photo: {response.status_code}")
+                
+        except Exception as e:
+            self.logger.error(f"❌ Error displaying photo for {person_name}: {e}", exc_info=True)
+    
+    def _upload_person_photo(self, person_name: str, photo_path: str) -> bool:
+        """Upload a person's photo to Misty.
+        
+        Args:
+            person_name: Name of the person
+            photo_path: Path to the photo file
+            
+        Returns:
+            True if upload successful, False otherwise
+        """
+        try:
+            import os
+            import base64
+            
+            # Check if file exists
+            if not os.path.exists(photo_path):
+                self.logger.error(f"Photo file not found: {photo_path}")
+                return False
+            
+            # Read photo file
+            with open(photo_path, 'rb') as f:
+                photo_data = f.read()
+            
+            # Convert to base64
+            base64_data = base64.b64encode(photo_data).decode('utf-8')
+            
+            # Generate filename for Misty (sanitize name)
+            safe_name = person_name.lower().replace(" ", "_").replace(".", "")
+            misty_filename = f"person_{safe_name}.jpg"
+            
+            self.logger.info(f"📤 Uploading {photo_path} as {misty_filename} ({len(photo_data)} bytes)")
+            
+            # Upload to Misty
+            response = self.misty.save_image(
+                fileName=misty_filename,
+                data=base64_data,
+                immediatelyApply=False,
+                overwriteExisting=True
+            )
+            
+            if response.status_code == 200:
+                # Store the Misty filename for future use
+                self.uploaded_photos[person_name] = misty_filename
+                self.logger.info(f"✅ Photo uploaded successfully: {misty_filename}")
+                return True
+            else:
+                self.logger.error(f"❌ Upload failed with status: {response.status_code}")
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"❌ Error uploading photo: {e}", exc_info=True)
+            return False
+    
+    def _preload_all_photos(self):
+        """Preload all configured photos to Misty for faster display."""
+        self.logger.info("🔄 Preloading person photos...")
+        
+        uploaded_count = 0
+        for person_name, photo_path in self.person_photos.items():
+            if self._upload_person_photo(person_name, photo_path):
+                uploaded_count += 1
+                self.logger.debug(f"  ✅ Preloaded: {person_name}")
+            else:
+                self.logger.warning(f"  ❌ Failed to preload: {person_name}")
+        
+        self.logger.info(f"✅ Preloaded {uploaded_count}/{len(self.person_photos)} photos")
+
     def _speak_and_reset(self, error_message: str):
         """Speak error message and return to idle state.
         
