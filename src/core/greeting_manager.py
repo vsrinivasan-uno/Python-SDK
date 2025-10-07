@@ -128,7 +128,7 @@ class GreetingManager:
                     now = time.time()
                     latency = now - recognized_at
                     self.logger.info(f"⏱️ Face→speak latency: {latency:.3f}s")
-                response = self.misty.speak(text=greeting_message, flush=True)
+                response = self.misty.speak(text=greeting_message, voice= "en-us-x-tpd-local" ,flush=True)
                 if response.status_code == 200:
                     self.logger.info("🔊 Greeting spoken successfully")
                 else:
