@@ -58,6 +58,10 @@ class VoiceAssistantConfig:
     audio_chunk_seconds: float = 1.5
     conversation_mode: bool = True  # Enable continuous conversation (no wake word after first activation)
     conversation_timeout_seconds: float = 10.0  # Timeout for conversation mode (silence before ending)
+    # Audio streaming/chunking configuration (realtime mode only)
+    audio_chunking_enabled: bool = True  # Enable audio streaming/chunking
+    chunk_duration_seconds: float = 6.0  # Chunk size in seconds (6s = 0.18MB, optimal balance)
+    parallel_upload_enabled: bool = True  # Pre-upload next chunk while playing current chunk
     
 
 @dataclass
@@ -149,6 +153,10 @@ class Config:
         chunk_seconds = float(os.getenv("AUDIO_CHUNK_SECONDS", "1.5"))
         conversation_mode = os.getenv("CONVERSATION_MODE", "true").lower() == "true"
         conversation_timeout = float(os.getenv("CONVERSATION_TIMEOUT_SECONDS", "10.0"))
+        # Audio chunking configuration
+        audio_chunking_enabled = os.getenv("AUDIO_CHUNKING_ENABLED", "true").lower() == "true"
+        chunk_duration = float(os.getenv("CHUNK_DURATION_SECONDS", "6.0"))
+        parallel_upload = os.getenv("PARALLEL_UPLOAD_ENABLED", "true").lower() == "true"
         
         return VoiceAssistantConfig(
             enabled=enabled,
@@ -159,7 +167,10 @@ class Config:
             max_recording_seconds=max_recording,
             audio_chunk_seconds=chunk_seconds,
             conversation_mode=conversation_mode,
-            conversation_timeout_seconds=conversation_timeout
+            conversation_timeout_seconds=conversation_timeout,
+            audio_chunking_enabled=audio_chunking_enabled,
+            chunk_duration_seconds=chunk_duration,
+            parallel_upload_enabled=parallel_upload
         )
     
     def _load_led_config(self) -> LEDConfig:
@@ -284,6 +295,13 @@ class Config:
         if self.voice_assistant.conversation_mode:
             print(f"    ↳ Continuous conversation enabled (no wake word after first question)")
             print(f"    ↳ Timeout: {self.voice_assistant.conversation_timeout_seconds}s of silence")
+        if self.voice_assistant.voice_mode == "realtime":
+            print(f"  Audio Chunking: {self.voice_assistant.audio_chunking_enabled}")
+            if self.voice_assistant.audio_chunking_enabled:
+                print(f"    ↳ Chunk Duration: {self.voice_assistant.chunk_duration_seconds}s (~{int(self.voice_assistant.chunk_duration_seconds * 32000 / 1024 / 1024 * 100) / 100}MB)")
+                print(f"    ↳ Parallel Upload: {self.voice_assistant.parallel_upload_enabled}")
+            else:
+                print(f"    ↳ Single-file playback (simpler but higher latency)")
         
         print(f"\n[LED Colors]")
         print(f"  Idle: RGB{self.led.idle}")

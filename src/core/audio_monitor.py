@@ -317,7 +317,8 @@ class AudioMonitor:
             return
         
         try:
-            self.logger.info("🎤 Starting direct speech capture (no wake word required)...")
+            capture_start = time.time()
+            self.logger.info(f"⏱️  [PERF] Starting direct speech capture at {capture_start:.3f}")
             
             # Use capture_speech instead of key phrase recognition
             # This captures ANY speech without requiring "Hey Misty"
@@ -328,8 +329,9 @@ class AudioMonitor:
                 requireKeyPhrase=False  # KEY: Don't require "Hey Misty"
             )
             
+            capture_end = time.time()
             if response.status_code == 200:
-                self.logger.info("✅ Direct speech capture started - speak now!")
+                self.logger.info(f"⏱️  [PERF] Direct speech capture started in {capture_end - capture_start:.3f}s - speak now!")
             else:
                 self.logger.error(f"❌ Failed to start speech capture: {response.status_code}")
                 

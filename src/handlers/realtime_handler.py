@@ -34,21 +34,32 @@ class RealtimeHandler:
         model: str = "gpt-4o-realtime-preview-2024-10-01",
         on_transcript_received: Optional[Callable[[str], None]] = None,
         on_audio_received: Optional[Callable[[bytes], None]] = None,
+        on_audio_chunk_received: Optional[Callable[[bytes, bool, int], None]] = None,
+        on_user_transcript_received: Optional[Callable[[str], None]] = None,
         chunk_ms: int = 100,
         use_audioop: bool = True,
+        chunk_threshold_bytes: int = 48000,
+        system_instructions: str = None,
     ):
         """Initialize the Realtime API handler.
         
         Args:
             api_key: OpenAI API key
             model: Realtime model to use
-            on_transcript_received: Callback when transcript text is received
-            on_audio_received: Callback when audio response is received
+            on_transcript_received: Callback when AI response transcript text is received
+            on_audio_received: Callback when complete audio response is received (legacy)
+            on_audio_chunk_received: Callback when audio chunk is ready (audio_bytes, is_final, chunk_index)
+            on_user_transcript_received: Callback when user input transcript is received
+            chunk_threshold_bytes: Bytes threshold for triggering chunk callback (default: 48000 = 1s @ 24kHz)
+            system_instructions: System-level instructions to set once at session level (much faster than per-request!)
         """
         self.api_key = api_key
         self.model = model
         self.on_transcript_received = on_transcript_received
         self.on_audio_received = on_audio_received
+        self.on_audio_chunk_received = on_audio_chunk_received
+        self.on_user_transcript_received = on_user_transcript_received
+        self.system_instructions = system_instructions  # Store for session configuration
         
         self.logger = logging.getLogger("RealtimeHandler")
         self.ws: Optional[websocket.WebSocketApp] = None
@@ -59,6 +70,11 @@ class RealtimeHandler:
         # Buffers for assembling streaming responses
         self.audio_buffers = {}  # response_id -> bytearray
         self.transcript_buffers = {}  # response_id -> str
+        
+        # Audio chunking configuration
+        self.chunk_threshold_bytes = chunk_threshold_bytes  # 48000 = 1 second @ 24kHz PCM16
+        self.chunk_counters = {}  # response_id -> chunk_index
+        
         # Streaming configuration: how many milliseconds per chunk (smaller -> faster time-to-first-byte)
         # Default 100ms -> at 24kHz samples_per_ms = 24 -> 2400 samples -> 4800 bytes
         self.chunk_ms = int(chunk_ms)
@@ -120,7 +136,8 @@ class RealtimeHandler:
         self.logger.info("✅ Connected to Realtime API")
         
         # Configure the session for audio input/output
-        self._configure_session()
+        # Pass system instructions if they were provided during init
+        self._configure_session(getattr(self, 'system_instructions', None))
 
     def _start_sender_thread(self):
         """Start background thread that drains the send queue."""
@@ -140,9 +157,18 @@ class RealtimeHandler:
         self.sender_thread = threading.Thread(target=_loop, daemon=True)
         self.sender_thread.start()
     
-    def _configure_session(self):
-        """Configure the session for audio input/output."""
+    def _configure_session(self, system_instructions: str = None):
+        """Configure the session for audio input/output.
+        
+        Args:
+            system_instructions: Optional system-level instructions to set for the session.
+                               If provided, these will be used for ALL responses in this session.
+        """
         self.logger.info("📋 Configuring Realtime API session...")
+        
+        # Use provided instructions or default
+        if not system_instructions:
+            system_instructions = "You are a helpful assistant. Keep responses concise and friendly."
         
         # Update session configuration (optimize for faster audio response)
         config_msg = {
@@ -150,18 +176,21 @@ class RealtimeHandler:
             "session": {
                 # Keep both modalities but minimize server work by disabling server VAD
                 "modalities": ["text", "audio"],
-                "instructions": "You are a helpful assistant. Keep responses concise and friendly.",
-                "voice": "sage",
+                "instructions": system_instructions,  # Set once at session level
+                "voice": "ash",
                 "input_audio_format": "pcm16",  # Expect PCM16 at 24kHz
                 "output_audio_format": "pcm16",  # Output PCM16 at 24kHz
-                # Disable server-side transcription and VAD; we explicitly commit and request
-                "input_audio_transcription": None,
+                # Enable input audio transcription to capture what user says
+                "input_audio_transcription": {
+                    "model": "whisper-1"
+                },
+                # Disable server-side VAD; we explicitly commit and request
                 "turn_detection": None
             }
         }
         
         self._send_json(config_msg)
-        self.logger.info("✅ Session configured")
+        self.logger.info("✅ Session configured with system instructions")
     
     def disconnect(self):
         """Disconnect from the Realtime API."""
@@ -228,32 +257,33 @@ class RealtimeHandler:
 
         # Handle rate limit events specifically
         if event_type == "rate_limits.updated":
-            # Pause outgoing sends until rate limit resets (if provided)
+            # DON'T pause on informational rate_limits.updated events!
+            # Only pause if we're actually rate limited (status code 429 or explicit retry_after)
             pause_secs = 0
-            # Common possible fields: retry_after (seconds), reset_after_ms
+            
+            # Check for ACTUAL rate limit indicators
             if isinstance(data.get("retry_after"), (int, float)):
                 pause_secs = int(data.get("retry_after"))
             elif isinstance(data.get("reset_after_ms"), (int, float)):
                 pause_secs = int(data.get("reset_after_ms") / 1000.0)
+            
+            # Only pause if we got an actual rate limit signal
+            if pause_secs > 0:
+                self.paused_until = time.time() + pause_secs
+                self.logger.warning(f"Rate limit hit - pausing sends for {pause_secs}s")
             else:
-                # try nested limits
-                limits = data.get("limits") or {}
-                if isinstance(limits, dict):
-                    # pick smallest reset hint available
-                    for k in ("reset_after_ms", "retry_after"):
-                        v = limits.get(k)
-                        if isinstance(v, (int, float)):
-                            if k.endswith("ms"):
-                                pause_secs = int(v / 1000.0)
-                            else:
-                                pause_secs = int(v)
+                # This is just informational - log but don't pause!
+                rate_limits = data.get("rate_limits", [])
+                if rate_limits:
+                    tokens_remaining = None
+                    for limit in rate_limits:
+                        if limit.get("name") == "tokens":
+                            tokens_remaining = limit.get("remaining")
                             break
-
-            if pause_secs <= 0:
-                pause_secs = 60  # default 60s if unspecified
-
-            self.paused_until = time.time() + pause_secs
-            self.logger.warning(f"Rate limit updated - pausing sends for {pause_secs}s")
+                    if tokens_remaining is not None:
+                        self.logger.debug(f"Rate limit info: {tokens_remaining} tokens remaining (no pause needed)")
+                    else:
+                        self.logger.debug("Rate limit info received (no pause needed)")
         
         # Extract response ID from various possible locations
         resp_id = self._extract_response_id(data)
@@ -264,6 +294,9 @@ class RealtimeHandler:
         
         elif event_type in ("response.audio_transcript.delta", "response.output_text.delta"):
             self._handle_transcript_delta(data, resp_id)
+        
+        elif event_type == "conversation.item.input_audio_transcription.completed":
+            self._handle_user_transcript(data)
         
         elif event_type in ("response.done", "response.completed"):
             self._handle_response_complete(resp_id)
@@ -290,7 +323,11 @@ class RealtimeHandler:
         return "default"
     
     def _handle_audio_delta(self, data: dict, resp_id: str):
-        """Handle audio delta events."""
+        """Handle audio delta events.
+        
+        If chunking is enabled (on_audio_chunk_received callback provided),
+        this will trigger chunk callbacks when threshold is reached.
+        """
         # Extract base64-encoded audio from various possible fields
         b64_audio = None
         
@@ -314,9 +351,29 @@ class RealtimeHandler:
                 chunk = base64.b64decode(b64_audio)
                 if resp_id not in self.audio_buffers:
                     self.audio_buffers[resp_id] = bytearray()
+                    self.chunk_counters[resp_id] = 0  # Initialize chunk counter
+                
                 self.audio_buffers[resp_id].extend(chunk)
                 
                 self.logger.debug(f"Audio delta: {len(chunk)} bytes (total: {len(self.audio_buffers[resp_id])})")
+                
+                # Check if we've reached chunk threshold
+                if self.on_audio_chunk_received and len(self.audio_buffers[resp_id]) >= self.chunk_threshold_bytes:
+                    # Send chunk callback
+                    chunk_bytes = bytes(self.audio_buffers[resp_id])
+                    chunk_index = self.chunk_counters[resp_id]
+                    
+                    self.logger.info(f"🎵 Audio chunk {chunk_index} ready: {len(chunk_bytes)} bytes")
+                    
+                    try:
+                        self.on_audio_chunk_received(chunk_bytes, False, chunk_index)
+                    except Exception as e:
+                        self.logger.error(f"Error in audio chunk callback: {e}")
+                    
+                    # Reset buffer for next chunk
+                    self.audio_buffers[resp_id] = bytearray()
+                    self.chunk_counters[resp_id] = chunk_index + 1
+                    
             except Exception as e:
                 self.logger.warning(f"Failed to decode audio delta: {e}")
     
@@ -346,6 +403,37 @@ class RealtimeHandler:
             
             self.logger.debug(f"Transcript delta: '{text}'")
     
+    def _handle_user_transcript(self, data: dict):
+        """Handle user input transcript events.
+        
+        This is called when the user's speech has been transcribed.
+        
+        Args:
+            data: Event data containing the user's transcript
+        """
+        # Extract transcript from event
+        transcript = None
+        
+        # Try direct transcript field
+        if isinstance(data.get("transcript"), str):
+            transcript = data["transcript"]
+        
+        # Try nested in item_id or content
+        elif isinstance(data.get("item_id"), dict):
+            transcript = data["item_id"].get("transcript")
+        
+        if transcript and transcript.strip():
+            self.logger.info(f"👤 User transcript: '{transcript}'")
+            
+            # Trigger callback if registered
+            if self.on_user_transcript_received:
+                try:
+                    self.on_user_transcript_received(transcript)
+                except Exception as e:
+                    self.logger.error(f"Error in user transcript callback: {e}")
+        else:
+            self.logger.debug(f"Received user transcript event but no transcript found: {data}")
+    
     def _handle_response_complete(self, resp_id: str):
         """Handle response completion event."""
         # Get assembled transcript and audio
@@ -360,7 +448,25 @@ class RealtimeHandler:
             except Exception as e:
                 self.logger.error(f"Error in transcript callback: {e}")
         
-        if audio_bytes and self.on_audio_received:
+        # Handle audio completion based on chunking mode
+        if self.on_audio_chunk_received:
+            # Chunking mode: send final chunk if there's any remaining audio
+            if audio_bytes:
+                chunk_index = self.chunk_counters.get(resp_id, 0)
+                self.logger.info(f"🎵 Final audio chunk {chunk_index}: {len(audio_bytes)} bytes")
+                try:
+                    self.on_audio_chunk_received(audio_bytes, True, chunk_index)
+                except Exception as e:
+                    self.logger.error(f"Error in final audio chunk callback: {e}")
+            else:
+                # No remaining audio, but still signal completion
+                self.logger.info(f"🎵 Response complete, no final chunk needed")
+            
+            # Clean up chunk counter
+            self.chunk_counters.pop(resp_id, None)
+            
+        elif audio_bytes and self.on_audio_received:
+            # Legacy mode: send complete audio
             self.logger.info(f"✅ Audio received: {len(audio_bytes)} bytes")
             try:
                 self.on_audio_received(audio_bytes)
@@ -520,26 +626,27 @@ class RealtimeHandler:
         
         self.logger.info("📋 Committed audio buffer")
     
-    def request_response(self, instructions: str = "Reply concisely as a helpful assistant."):
+    def request_response(self):
         """Request a response from the Realtime API.
         
-        Args:
-            instructions: Instructions for the AI response
+        This uses the session-level instructions set during _configure_session().
+        No per-request instructions are needed - this keeps the API fast!
         """
         if not self.connected:
             self.logger.error("Cannot request response - not connected")
             return
         
+        # Don't send instructions here - they're already set at session level!
+        # This dramatically reduces processing time for conversation follow-ups
         msg = {
             "type": "response.create",
             "response": {
-                "instructions": instructions,
                 "modalities": ["text", "audio"]
             }
         }
         self._send_json(msg)
         
-        self.logger.info(f"🤖 Requested response with modalities: ['text', 'audio']")
+        self.logger.info(f"🤖 Requested response (using session instructions)")
     
     def _send_json(self, payload: dict):
         """Send JSON message to the WebSocket."""
@@ -641,8 +748,8 @@ class RealtimeHandler:
     def process_audio_file(self, audio_bytes: bytes):
         """Process a complete audio file through the Realtime API.
         
-        With session VAD enabled, the API will automatically:
-        1. Detect speech in the audio
+        The API will:
+        1. Process the audio using session-level instructions
         2. Transcribe it
         3. Generate a response
         4. Send back audio
@@ -662,8 +769,24 @@ class RealtimeHandler:
             return
 
         # 3) Explicitly request a response (text + audio)
-        #    Even with server VAD enabled, requesting a response is the most
-        #    reliable trigger for output across model versions.
+        #    CRITICAL: Don't send instructions here! They're set once at session level.
+        #    Sending the huge prompt with every request causes 40+ second delays!
+        try:
+            self.request_response()  # Use session-level instructions
+        except Exception as e:
+            self.logger.error(f"Failed to request response: {e}")
+            return
+
+        self.logger.info("🎤 Audio sent, committed, and response requested - awaiting output...")
+
+
+    def _OLD_process_audio_file_WITH_INLINE_PROMPT(self, audio_bytes: bytes):
+        """OLD VERSION - DO NOT USE - This sends the prompt with every request causing delays!
+        
+        Keeping this for reference only. The new process_audio_file() uses session-level
+        instructions which are MUCH faster for conversation mode.
+        """
+        # This was causing 40+ second delays in conversation mode!
         try:
             self.request_response(
                 instructions=(
@@ -791,29 +914,41 @@ Email: istt@unomaha.edu
 Address: PKI 280, 1110 South 67th Street, Omaha, NE 68182
 
 Communication Style
-CRITICAL: Keep responses short, crisp, and conversational
+⚠️ CRITICAL - VOICE INTERFACE CONSTRAINTS ⚠️
+You are speaking through a ROBOT with LIMITED AUDIO PLAYBACK capability.
+Your responses MUST be EXTREMELY brief to avoid system errors.
 
-Write like you're having a natural conversation, not giving a presentation
-Use 2-4 sentences for most responses
-Break up longer information into digestible chunks
-Avoid walls of text and long paragraphs
-Don't list everything at once - share what's relevant to their question
-Use a friendly, casual tone while staying professional
-It's okay to follow up with "Want to know more about [specific topic]?" to keep it interactive
+MAXIMUM RESPONSE LENGTH: 10-15 seconds of speaking (approximately 30-40 words or 2 SHORT sentences)
 
-Example of good response style:
+Required Response Format:
+- Keep responses to 1-2 SHORT sentences ONLY
+- If the question requires more information, answer the CORE question first, then ask if they want more details
+- Use progressive disclosure: give a quick answer, then invite follow-up questions
+- NEVER list multiple items in one response - pick the most important 1-2 points only
+- Think "text message" not "email"
+
+Example of PERFECT responses (this is the standard):
+"The BSAI program starts Spring 2025. Want to know what you'll learn?"
+"It's the first AI bachelor's degree in Nebraska! Interested in the curriculum or career paths?"
+"Tuition varies by residency. Should I explain in-state or out-of-state costs?"
+
+Example of TOO LONG (NEVER do this):
 "The BSAI program starts Spring 2025 and it's actually the first AI bachelor's degree in Nebraska! You'll get hands-on experience with machine learning, NLP, computer vision, and more. What aspect interests you most?"
-Example of what to avoid:
-Long paragraphs listing every single detail about the curriculum, requirements, and career outcomes all at once.
+
+WHY THIS MATTERS:
+- Long responses (>15 seconds) cause audio playback failures
+- Short responses feel more natural in conversation
+- Users can ask follow-up questions for details they want
 Response Guidelines
 When responding to questions within your scope:
 
-Be helpful and conversational
-Answer directly and concisely
-Share 1-3 key points, not everything at once
-Ask follow-up questions to keep the conversation flowing
-Use natural language, not formal/robotic phrasing
-Direct to contact info only when they need specific help (applications, detailed questions)
+Answer ONLY the core question in 1-2 SHORT sentences (max 30-40 words)
+If more info exists, invite a follow-up question instead of providing it all
+NEVER list multiple items - pick the single most relevant point
+Keep total speaking time under 15 seconds
+Think "quick answer + invitation for more" not "comprehensive response"
+
+Template: [Quick answer in 1 sentence]. [Follow-up question or invitation for more details]?
 
 When users ask questions OUTSIDE your scope:
 Keep it brief and friendly:
@@ -836,10 +971,11 @@ NEVER discuss other universities or compare programs
 NEVER provide technical AI assistance or coding help
 NEVER give definitive admission decisions
 ALWAYS stay within the scope of UNO and the BSAI program
-ALWAYS keep responses short and conversational
+ALWAYS keep responses ULTRA-SHORT (1-2 sentences, max 15 seconds speaking)
 ALWAYS be honest when you don't have information
+ALWAYS invite follow-up questions instead of dumping all information at once
 
-Keep it natural, keep it brief, keep it helpful!RetryClaude can make mistakes. Please double-check responses."""
+Keep it natural, keep it BRIEF (seriously, VERY brief!), keep it helpful!RetryClaude can make mistakes. Please double-check responses."""
                 )
             )
         except Exception as e:
