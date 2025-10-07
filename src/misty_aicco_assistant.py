@@ -51,17 +51,20 @@ class AudioQueueManager:
     - Handling AudioPlayComplete events to trigger next chunk
     """
     
-    def __init__(self, misty, logger, config, on_response_complete=None):
+    def __init__(self, misty, logger, config, on_response_complete=None, personality_manager=None):
         """Initialize the AudioQueueManager.
         
         Args:
             misty: Misty robot instance
             logger: Logger instance
             config: Configuration object
+            on_response_complete: Optional callback when response is complete
+            personality_manager: Optional PersonalityManager for animations
         """
         self.misty = misty
         self.logger = logger
         self.config = config
+        self.personality_manager = personality_manager
         
         # Queue of chunks ready to play: [(filename, wav_data, is_final), ...]
         self.play_queue = []
@@ -72,6 +75,7 @@ class AudioQueueManager:
         self.currently_uploading = False  # Track if upload is in progress
         self.is_processing = False
         self.fallback_timer = None  # Timer for fallback playback completion
+        self.animations_started = False  # Track if we started continuous animations
         
         # Statistics
         self.chunks_received = 0
@@ -335,6 +339,15 @@ class AudioQueueManager:
                 self.logger.info(f"✅ Playback started for {filename}")
                 self.chunks_played += 1
                 
+                # Start continuous speaking animations on first chunk (non-blocking, parallel)
+                if not self.animations_started and self.personality_manager:
+                    try:
+                        self.personality_manager.start_continuous_speaking_movements()
+                        self.animations_started = True
+                        self.logger.debug("🎭 Started continuous speaking animations")
+                    except Exception as e:
+                        self.logger.warning(f"Failed to start speaking animations: {e}")
+                
                 # CRITICAL FIX: AudioPlayComplete event may not fire reliably for short chunks
                 # Calculate actual audio duration dynamically
                 if wav_data and len(wav_data) > 44:  # WAV header is 44 bytes
@@ -447,6 +460,15 @@ class AudioQueueManager:
         """Complete the response and return to idle state."""
         self.logger.info(f"📊 Response complete: {self.chunks_played}/{self.chunks_received} chunks played, {self.chunks_uploaded} chunks uploaded")
         
+        # Stop continuous speaking animations if they were started
+        if self.animations_started and self.personality_manager:
+            try:
+                self.personality_manager.stop_continuous_speaking_movements()
+                self.animations_started = False
+                self.logger.debug("🎭 Stopped continuous speaking animations")
+            except Exception as e:
+                self.logger.warning(f"Failed to stop speaking animations: {e}")
+        
         # Clean up any remaining files
         self._cleanup_all_files()
         
@@ -464,9 +486,11 @@ class AudioQueueManager:
         # Notify assistant that response finished so it can restart listening
         try:
             if getattr(self, "on_response_complete", None):
+                self.logger.info("📞 Calling on_response_complete callback to resume assistant state...")
                 self.on_response_complete()
+                self.logger.info("✅ on_response_complete callback completed")
         except Exception as e:
-            self.logger.error(f"Error in on_response_complete callback: {e}", exc_info=True)
+            self.logger.error(f"❌ Error in on_response_complete callback: {e}", exc_info=True)
     
     def clear(self):
         """Clear the queue and reset state."""
@@ -474,6 +498,14 @@ class AudioQueueManager:
             self.play_queue.clear()
             self.currently_playing = None
             self.is_processing = False
+        
+        # Stop animations if they were running
+        if self.animations_started and self.personality_manager:
+            try:
+                self.personality_manager.stop_continuous_speaking_movements()
+                self.animations_started = False
+            except Exception as e:
+                self.logger.warning(f"Failed to stop animations during clear: {e}")
         
         # Clean up all uploaded files
         self._cleanup_all_files()
@@ -795,10 +827,21 @@ class MistyAiccoAssistant:
         if getattr(self, "speaking_lock", False):
             self.logger.debug("Ignoring face recognition during speaking")
             return
+        
+        # Ignore face recognition during active conversation mode
+        if self.conversation_active:
+            self.logger.debug("Ignoring face recognition during active conversation")
+            return
+        
         name = face_data.get("name", "Unknown")
         confidence = face_data.get("confidence", 0.0)
         
         self.logger.info(f"👤 Face recognized: {name} (confidence: {confidence:.2f})")
+        
+        # PAUSE AUDIO MONITOR during face greeting to prevent conflicts
+        if self.audio_monitor:
+            self.logger.debug("⏸️  Pausing audio monitor for face greeting")
+            self.audio_monitor.pause()
         
         # Record interaction (resets idle timer)
         if self.personality_manager:
@@ -821,6 +864,19 @@ class MistyAiccoAssistant:
                 except Exception:
                     # Non-fatal if animation thread fails
                     pass
+            
+            # RESUME AUDIO MONITOR after greeting completes (with delay for TTS)
+            # Schedule resume in background thread to avoid blocking
+            def resume_after_greeting():
+                time.sleep(3.0)  # Wait for greeting to complete (adjust based on typical greeting length)
+                if self.audio_monitor:
+                    self.logger.debug("▶️  Resuming audio monitor after face greeting")
+                    self.audio_monitor.resume()
+                    # Restart wake word detection if not in conversation mode
+                    if not self.conversation_active:
+                        self.audio_monitor.restart_wake_word_detection()
+            
+            threading.Thread(target=resume_after_greeting, daemon=True).start()
     
     def _initialize_voice_assistant(self):
         """Initialize voice assistant module.
@@ -905,7 +961,8 @@ class MistyAiccoAssistant:
                 self.misty,
                 self.logger,
                 self.config,
-                on_response_complete=self._exit_speaking_state_after_playback
+                on_response_complete=self._exit_speaking_state_after_playback,
+                personality_manager=self.personality_manager
             )
             self.logger.info("    ✅ Audio queue initialized")
             
@@ -972,8 +1029,21 @@ class MistyAiccoAssistant:
         """
         self.logger.info("🎤 Wake word detected!")
         
+        # DIAGNOSTIC: Log current system state when wake word is detected
+        self.logger.info(f"🔍 DIAGNOSTIC - System State at Wake Word:")
+        self.logger.info(f"   - In screensaver: {self.personality_manager.in_screensaver if self.personality_manager else 'N/A'}")
+        self.logger.info(f"   - Services stopped: {self.services_stopped}")
+        self.logger.info(f"   - Conversation active: {self.conversation_active}")
+        self.logger.info(f"   - Speaking lock: {self.speaking_lock}")
+        
+        # PAUSE FACE RECOGNITION during voice interaction to prevent conflicts
+        if self.face_recognition_manager and self.face_recognition_manager.running:
+            self.logger.debug("⏸️  Pausing face recognition for voice interaction")
+            self.face_recognition_manager.stop()
+        
         # Record interaction (resets idle timer, wakes from screensaver if needed)
         if self.personality_manager:
+            self.logger.info("🔄 Recording interaction - will exit screensaver if active")
             self.personality_manager.record_interaction()
         
         # Start conversation mode if enabled
@@ -1361,6 +1431,13 @@ class MistyAiccoAssistant:
             self.misty.change_led(*self.config.led.speaking)
             self.logger.info(f"🔊 Playing realtime audio: {filename}")
             
+            # Start continuous speaking animations (non-blocking, parallel)
+            if self.personality_manager:
+                try:
+                    self.personality_manager.start_continuous_speaking_movements()
+                except Exception as e:
+                    self.logger.warning(f"Failed to start speaking animations: {e}")
+            
             play_response = self.misty.play_audio(fileName=filename, volume=100)
             if play_response.status_code == 200:
                 self.logger.info("✅ Audio playback started")
@@ -1370,6 +1447,13 @@ class MistyAiccoAssistant:
         except Exception as e:
             self.logger.error(f"❌ Failed to play audio: {e}")
         finally:
+            # Stop continuous speaking animations
+            if self.personality_manager:
+                try:
+                    self.personality_manager.stop_continuous_speaking_movements()
+                except Exception as e:
+                    self.logger.warning(f"Failed to stop speaking animations: {e}")
+            
             self._exit_speaking_state_after_playback()
             self.logger.info("✅ Realtime response complete!")
     
@@ -1406,6 +1490,8 @@ class MistyAiccoAssistant:
 
     def _exit_speaking_state_after_playback(self):
         """Exit speaking state and transition to conversation follow-up or idle."""
+        self.logger.info("🔄 Exiting speaking state...")
+        
         # Conversation mode follow-ups
         if self.config.voice_assistant.conversation_mode and self.conversation_active:
             self.logger.info("💬 Conversation mode active - listening for follow-up...")
@@ -1424,8 +1510,11 @@ class MistyAiccoAssistant:
                     self.audio_monitor.capture_speech_without_wake_word()
                 except Exception:
                     pass
+            # Keep face recognition paused during conversation mode
+            self.logger.info("⏸️  Face recognition stays OFF during conversation mode")
         else:
             # Return to idle and wake word mode
+            self.logger.info("🏠 Returning to wake word listening mode...")
             try:
                 self.misty.change_led(*self.config.led.idle)
                 self.logger.debug(f"💡 LED returned to idle: RGB{self.config.led.idle}")
@@ -1435,9 +1524,15 @@ class MistyAiccoAssistant:
                 try:
                     self.audio_monitor.resume()
                     self.audio_monitor.restart_wake_word_detection()
-                except Exception:
-                    pass
+                except Exception as e:
+                    self.logger.error(f"Failed to restart audio monitor: {e}")
+            
+            # DO NOT RESUME FACE RECOGNITION - it should stay off after voice interaction starts
+            # Face recognition only runs at startup before any "Hey Misty" is detected
+            self.logger.info("👀 Face recognition remains OFF (only active at startup before voice interaction)")
+        
         self.speaking_lock = False
+        self.logger.info("🔓 Speaking lock released")
 
     def _wait_for_audio_play_complete(self, timeout_seconds: float = 30.0):
         """Block until AudioPlayComplete event arrives or timeout."""
@@ -1525,11 +1620,12 @@ class MistyAiccoAssistant:
     def _end_conversation(self):
         """End the current conversation session."""
         if not self.conversation_active:
+            self.logger.debug("_end_conversation called but conversation not active")
             return
         
         self.conversation_active = False
         self._cancel_conversation_timer()
-        self.logger.info("🎬 Ending conversation mode - returning to idle")
+        self.logger.info("🎬 Ending conversation mode - returning to greeting mode")
         
         # Return LED to idle
         try:
@@ -1539,7 +1635,28 @@ class MistyAiccoAssistant:
         
         # Restart wake word detection for next "Hey Misty"
         if self.audio_monitor:
+            self.logger.info("🔄 Restarting wake word detection...")
             self.audio_monitor.restart_wake_word_detection()
+        
+        # RESUME FACE RECOGNITION after conversation ends (return to greeting mode)
+        self.logger.info("👀 Resuming face recognition after conversation ends...")
+        if self.face_recognition_manager:
+            self.logger.info(f"   Face recognition manager exists: running={self.face_recognition_manager.running}")
+            self.logger.info(f"   Face recognition enabled in config: {self.config.face_recognition.enabled}")
+            
+            if not self.face_recognition_manager.running and self.config.face_recognition.enabled:
+                self.logger.info("▶️  Starting face recognition (returning to greeting mode)...")
+                try:
+                    self.face_recognition_manager.start()
+                    self.logger.info("✅ Face recognition resumed successfully - back to greeting mode!")
+                except Exception as e:
+                    self.logger.error(f"❌ Failed to resume face recognition: {e}", exc_info=True)
+            elif self.face_recognition_manager.running:
+                self.logger.info("ℹ️  Face recognition already running")
+            else:
+                self.logger.warning("⚠️  Face recognition not enabled in config")
+        else:
+            self.logger.warning("⚠️  Face recognition manager not initialized")
     
     def _start_conversation_timer(self):
         """Start or restart the conversation timeout timer."""
@@ -1782,9 +1899,25 @@ class MistyAiccoAssistant:
                 self.logger.info("   Stopping face recognition (camera off)...")
                 self.face_recognition_manager.stop()
             
-            # KEEP audio monitor running so we can hear "Hey Misty" to wake up!
-            # Note: Not stopping audio monitor - wake word detection stays active
-            self.logger.info("   Audio monitor stays active - listening for 'Hey Misty' to wake up")
+            # DIAGNOSTIC: Check audio monitor state before screensaver
+            if self.audio_monitor:
+                status = self.audio_monitor.get_status()
+                self.logger.info(f"🔍 DIAGNOSTIC - Audio Monitor State:")
+                self.logger.info(f"   - Running: {status['running']}")
+                self.logger.info(f"   - Paused: {status['paused']}")
+                self.logger.info(f"   - Mode: {status['mode']}")
+                
+                # CRITICAL FIX: Ensure audio monitor is active and listening for wake word
+                if status['paused']:
+                    self.logger.warning("⚠️  Audio monitor was PAUSED - resuming for wake word detection")
+                    self.audio_monitor.resume()
+                
+                # CRITICAL FIX: Restart wake word detection to ensure it's active in screensaver
+                self.logger.info("🔄 Restarting wake word detection for screensaver mode...")
+                self.audio_monitor.restart_wake_word_detection()
+                self.logger.info("✅ Wake word detection restarted - 'Hey Misty' will wake from screensaver")
+            else:
+                self.logger.warning("⚠️  Audio monitor not initialized - wake word won't work!")
             
             self.services_stopped = True
             self.logger.info("✅ Screensaver active - say 'Hey Misty' to wake up anytime!")
@@ -1805,9 +1938,23 @@ class MistyAiccoAssistant:
                 self.logger.info("   Restarting face recognition (camera on)...")
                 self.face_recognition_manager.start()
             
-            # Audio monitor was never stopped - it stayed active for wake word detection
-            # No need to restart it
-            self.logger.info("   Audio monitor already active")
+            # DIAGNOSTIC: Verify audio monitor is still working after wake
+            if self.audio_monitor:
+                status = self.audio_monitor.get_status()
+                self.logger.info(f"🔍 DIAGNOSTIC - Audio Monitor State After Wake:")
+                self.logger.info(f"   - Running: {status['running']}")
+                self.logger.info(f"   - Paused: {status['paused']}")
+                self.logger.info(f"   - Mode: {status['mode']}")
+                
+                # Ensure audio monitor is ready for next wake word
+                if status['paused']:
+                    self.logger.warning("⚠️  Audio monitor was paused after wake - resuming")
+                    self.audio_monitor.resume()
+                    self.audio_monitor.restart_wake_word_detection()
+                
+                self.logger.info("✅ Audio monitor verified - ready for 'Hey Misty'")
+            else:
+                self.logger.warning("⚠️  Audio monitor not initialized")
             
             self.services_stopped = False
             self.logger.info("✅ Services restarted - ready for interactions!")
