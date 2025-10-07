@@ -34,6 +34,7 @@ class FaceRecognitionManager:
         self.on_face_recognized = on_face_recognized
         self.logger = logging.getLogger("FaceRecognitionManager")
         self.running = False
+        self.paused = False  # NEW: Track pause state
         self.event_name = "FaceRecognitionEvent"
         self.camera_active_color = camera_active_color  # RGB color when camera is on
         
@@ -201,6 +202,37 @@ class FaceRecognitionManager:
             
         except Exception as e:
             self.logger.error(f"Error stopping face recognition: {e}", exc_info=True)
+    def pause(self):
+        """Pause face recognition temporarily (ignore events but keep service running).
+        
+        This is more efficient than stop/start as it keeps Misty's face recognition
+        service running but simply ignores incoming events. Use this for temporary
+        pauses during voice interactions or greetings.
+        """
+        if not self.running:
+            self.logger.warning("Cannot pause - face recognition not running")
+            return
+        
+        self.paused = True
+        self.logger.info("⏸️  Face recognition paused (events ignored, service still running)")
+    
+    def resume(self):
+        """Resume face recognition after a pause.
+        
+        Re-enables event processing after a pause() call. The face recognition
+        service continues running, so this is instantaneous.
+        """
+        if not self.running:
+            self.logger.warning("Cannot resume - face recognition not running")
+            return
+        
+        if not self.paused:
+            self.logger.debug("Face recognition is not paused, resume ignored")
+            return
+        
+        self.paused = False
+        self.logger.info("▶️  Face recognition resumed")
+    
     
     def _on_face_detected(self, event_data: dict):
         """Internal callback for face recognition events.
@@ -211,6 +243,11 @@ class FaceRecognitionManager:
             event_data: Event data from Misty's face recognition system
         """
         try:
+            # Check if paused (ignore events while paused)
+            if self.paused:
+                self.logger.debug("Face detection event ignored (paused)")
+                return
+            
             # Log raw event for debugging
             self.logger.debug(f"Face recognition event received: {event_data}")
             

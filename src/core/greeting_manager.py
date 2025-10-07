@@ -221,25 +221,7 @@ class GreetingManager:
                         self.logger.info(f"✅ Local cached greeting delivered to '{person_name}'")
                         return True
                 
-                # Priority 2: Use Realtime API if available (for non-cached greetings)
-                if self.use_realtime_api and self.realtime_handler and self.realtime_handler.connected:
-                    self.logger.info("🎙️ Using OpenAI Realtime API for greeting (on-the-fly)")
-                    success = self._speak_with_realtime_api(greeting_message)
-                    if success:
-                        # Success! Update tracking and return
-                        self.last_greeting_times[person_name] = time.time()
-                        time.sleep(2)
-                        try:
-                            r, g, b = self.idle_led_color
-                            self.misty.change_led(red=r, green=g, blue=b)
-                        except Exception as e:
-                            self.logger.warning(f"⚠️ Failed to reset LED: {e}")
-                        self.logger.info(f"✅ Realtime greeting delivered to '{person_name}'")
-                        return True
-                    else:
-                        self.logger.warning("⚠️ Realtime API greeting failed, falling back to Misty TTS")
-                
-                # Priority 3: Fallback to Misty's built-in TTS
+                # Priority 2: Fallback to Misty's built-in TTS (Realtime API not suitable for greetings)
                 self.logger.info("🔊 Using Misty's built-in TTS for greeting")
                 response = self.misty.speak(text=greeting_message, voice="en-us-x-tpd-local", flush=True)
                 if response.status_code == 200:
@@ -352,56 +334,7 @@ class GreetingManager:
             self.logger.error(f"❌ Error playing local cached greeting: {e}", exc_info=True)
             return False
     
-    def _speak_with_realtime_api(self, text: str) -> bool:
-        """Speak text using OpenAI Realtime API for consistent voice.
-        
-        This method converts text to speech using OpenAI's Realtime API,
-        providing the same voice quality as the voice assistant.
-        
-        Args:
-            text: Text to speak
-            
-        Returns:
-            True if successful, False otherwise
-        """
-        try:
-            if not self.realtime_handler or not self.realtime_handler.connected:
-                self.logger.warning("Realtime handler not available or not connected")
-                return False
-            
-            # Create a text-only input for the Realtime API to convert to speech
-            # We'll use the session's voice configuration (set during initialization)
-            self.logger.info(f"📤 Sending greeting text to Realtime API")
-            
-            # Send text message to Realtime API for TTS conversion
-            # Use a direct instruction to speak the greeting exactly as provided
-            import json
-            message = {
-                "type": "conversation.item.create",
-                "item": {
-                    "type": "message",
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": f"Say this exact greeting with enthusiasm: {text}"
-                        }
-                    ]
-                }
-            }
-            self.realtime_handler._send_json(message)
-            
-            # Request response (will use session-level voice settings)
-            self.realtime_handler.request_response()
-            
-            # Audio chunks will arrive via the realtime handler's callbacks
-            # which are connected to the audio queue manager
-            self.logger.info("✅ Greeting sent to Realtime API, awaiting audio response")
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"❌ Error speaking with Realtime API: {e}", exc_info=True)
-            return False
+    
     
     def reset_cooldown(self, person_name: Optional[str] = None):
         """Reset cooldown for a specific person or all people.

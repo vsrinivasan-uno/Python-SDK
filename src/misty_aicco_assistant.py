@@ -857,13 +857,16 @@ class MistyAiccoAssistant:
                 cooldown_status = self.greeting_manager.get_greeting_status(name)
                 self.logger.info(f"   Cooldown remaining: {cooldown_status['cooldown_remaining']:.1f}s")
         
-        # PAUSE AUDIO MONITOR during face greeting to prevent conflicts
+        # PAUSE BOTH SYSTEMS during face greeting to prevent conflicts
         # BUT ONLY if we're actually going to deliver a greeting
-        if self.audio_monitor and will_greet:
-            self.logger.debug("⏸️  Pausing audio monitor for face greeting")
-            self.audio_monitor.pause()
-        elif self.audio_monitor and not will_greet:
-            self.logger.debug("ℹ️  Skipping audio monitor pause - greeting won't be delivered (cooldown active)")
+        if will_greet:
+            self.logger.debug("⏸️  Pausing both audio monitor and face recognition for greeting")
+            if self.audio_monitor:
+                self.audio_monitor.pause()
+            if self.face_recognition_manager:
+                self.face_recognition_manager.pause()
+        else:
+            self.logger.debug("ℹ️  Skipping pause - greeting won't be delivered (cooldown active)")
         
         # Record interaction (resets idle timer)
         # if self.personality_manager:
@@ -897,6 +900,8 @@ class MistyAiccoAssistant:
                     # Local cached greetings are typically 2-4 seconds
                     # Add buffer for upload/playback initialization
                     time.sleep(5.0)  # Increased from 3s to 5s for reliable completion
+                    
+                    # RESUME BOTH SYSTEMS after greeting
                     if self.audio_monitor:
                         self.logger.debug("▶️  Resuming audio monitor after face greeting")
                         self.audio_monitor.resume()
@@ -905,6 +910,10 @@ class MistyAiccoAssistant:
                             self.logger.info("🔄 Restarting wake word detection after greeting...")
                             self.audio_monitor.restart_wake_word_detection()
                             self.logger.info("✅ Wake word detection restarted - 'Hey Misty' is now active!")
+                    
+                    if self.face_recognition_manager and self.config.face_recognition.enabled:
+                        self.logger.debug("▶️  Resuming face recognition after greeting")
+                        self.face_recognition_manager.resume()
                 
                 threading.Thread(target=resume_after_greeting, daemon=True).start()
             else:
@@ -1081,7 +1090,7 @@ class MistyAiccoAssistant:
         # PAUSE FACE RECOGNITION during voice interaction to prevent conflicts
         if self.face_recognition_manager and self.face_recognition_manager.running:
             self.logger.debug("⏸️  Pausing face recognition for voice interaction")
-            self.face_recognition_manager.stop()
+            self.face_recognition_manager.pause()  # Use pause() not stop() for faster resume
         
         # Record interaction (resets idle timer, wakes from screensaver if needed)
         if self.personality_manager:
@@ -1569,9 +1578,14 @@ class MistyAiccoAssistant:
                 except Exception as e:
                     self.logger.error(f"Failed to restart audio monitor: {e}")
             
-            # DO NOT RESUME FACE RECOGNITION - it should stay off after voice interaction starts
-            # Face recognition only runs at startup before any "Hey Misty" is detected
-            self.logger.info("👀 Face recognition remains OFF (only active at startup before voice interaction)")
+            # RESUME FACE RECOGNITION after voice interaction (parallel operation mode)
+            if self.face_recognition_manager and self.config.face_recognition.enabled:
+                if self.face_recognition_manager.running and self.face_recognition_manager.paused:
+                    self.logger.info("👀 Resuming face recognition after voice interaction...")
+                    self.face_recognition_manager.resume()
+                    self.logger.info("✅ Face recognition resumed - parallel operation with wake word")
+                else:
+                    self.logger.debug("ℹ️  Face recognition not paused, no resume needed")
         
         self.speaking_lock = False
         self.logger.info("🔓 Speaking lock released")
@@ -1683,18 +1697,27 @@ class MistyAiccoAssistant:
         # RESUME FACE RECOGNITION after conversation ends (return to greeting mode)
         self.logger.info("👀 Resuming face recognition after conversation ends...")
         if self.face_recognition_manager:
-            self.logger.info(f"   Face recognition manager exists: running={self.face_recognition_manager.running}")
+            self.logger.info(f"   Face recognition manager exists: running={self.face_recognition_manager.running}, paused={self.face_recognition_manager.paused}")
             self.logger.info(f"   Face recognition enabled in config: {self.config.face_recognition.enabled}")
             
             if not self.face_recognition_manager.running and self.config.face_recognition.enabled:
+                # Face recognition was stopped (e.g., in screensaver) - restart it
                 self.logger.info("▶️  Starting face recognition (returning to greeting mode)...")
                 try:
                     self.face_recognition_manager.start()
+                    self.logger.info("✅ Face recognition started successfully - back to greeting mode!")
+                except Exception as e:
+                    self.logger.error(f"❌ Failed to start face recognition: {e}", exc_info=True)
+            elif self.face_recognition_manager.running and self.face_recognition_manager.paused:
+                # Face recognition is running but paused - resume it
+                self.logger.info("▶️  Resuming face recognition (returning to greeting mode)...")
+                try:
+                    self.face_recognition_manager.resume()
                     self.logger.info("✅ Face recognition resumed successfully - back to greeting mode!")
                 except Exception as e:
                     self.logger.error(f"❌ Failed to resume face recognition: {e}", exc_info=True)
             elif self.face_recognition_manager.running:
-                self.logger.info("ℹ️  Face recognition already running")
+                self.logger.info("ℹ️  Face recognition already running and active")
             else:
                 self.logger.warning("⚠️  Face recognition not enabled in config")
         else:
