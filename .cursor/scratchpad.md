@@ -4343,3 +4343,137 @@ Now face recognition is only blocked when:
 ### Status
 🔧 **CRITICAL BUG FIXED** - Face recognition events now properly processed after conversation ends
 
+
+## Movement Animations During Conversations (October 7, 2025)
+
+### Feature Request
+Add realistic movement on Misty during conversations (hands & neck) as a cosmetic, non-blocking enhancement. **Critical requirement**: NO changes to GPT/realtime code - latency is the top priority.
+
+### Findings
+Movement animations ALREADY EXIST in `personality_manager.py`:
+- `speaking_animation()` - Head bobs + arm gestures
+- `thinking_animation()` - Head movements  
+- `listening_animation()` - Subtle head tilt
+
+**BUT**: They were DISABLED or NOT USED in realtime mode because:
+1. The existing `speaking_animation()` is BLOCKING (uses `time.sleep()`)
+2. Thinking animation was commented out due to 10-15s latency issues
+3. NO animations were running during realtime GPT responses
+
+### Solution Implemented
+Created **non-blocking continuous animation system** that runs in parallel:
+
+#### 1. PersonalityManager Enhancements (`src/core/personality_manager.py`)
+- Added `start_continuous_speaking_movements()` - Starts background animation thread
+- Added `stop_continuous_speaking_movements()` - Stops animations and resets to neutral
+- Added `_continuous_speaking_loop()` - Continuous movement generation (runs in separate thread)
+
+**Movement Characteristics**:
+- Random head movements every 0.8-1.5 seconds (pitch: -8 to +8, yaw: -20 to +20, roll: -3 to +3)
+- Arm gestures every 2-3 movements (position: -25 to +25)
+- Occasional joy expressions every 3-5 movements
+- Natural variation in velocity and duration
+- Thread-based: **ZERO blocking**, **ZERO latency impact**
+
+#### 2. AudioQueueManager Integration (Chunked Realtime Mode)
+- Added `personality_manager` parameter to `__init__()`
+- Added `animations_started` flag to track animation state
+- **Start animations**: In `_play_chunk()` when first chunk plays (line 342-349)
+- **Stop animations**: In `_complete_response()` when all chunks done (line 463-470)
+- **Safety stop**: In `clear()` for error cases (line 502-508)
+
+#### 3. Non-Chunked Realtime Mode Integration
+- Added animations to `_play_realtime_audio()` (line 1409-1430)
+- Start animations immediately before `play_audio()` call
+- Stop animations in finally block after playback completes
+- Fully wrapped in try/except - failures don't break audio playback
+
+#### 4. Initialization Update
+- Updated AudioQueueManager initialization to pass `personality_manager` (line 948)
+
+### Key Design Decisions
+1. **Parallel Execution**: Animations run in separate thread - NO impact on audio pipeline
+2. **Fire and Forget**: Movement commands are sent without waiting for completion
+3. **Natural Randomness**: Random intervals (0.8-1.5s) and parameters for organic feel
+4. **Graceful Degradation**: All animation code wrapped in try/except - failures are logged but don't break functionality
+5. **Clean Shutdown**: Proper thread joining and neutral pose reset on stop
+
+### Testing Checklist
+- [ ] Test chunked realtime mode - verify animations during speech
+- [ ] Test non-chunked realtime mode - verify animations during speech  
+- [ ] Test traditional mode - ensure existing blocking animation still works
+- [ ] Verify NO latency increase in audio responses
+- [ ] Verify smooth start/stop of animations
+- [ ] Test error cases - verify graceful failure handling
+
+### Files Modified
+1. `src/core/personality_manager.py` - Added continuous animation methods
+2. `src/misty_aicco_assistant.py` - Integrated animations into audio playback
+
+### Status
+✅ **IMPLEMENTATION COMPLETE** - Ready for user testing
+
+**Next Step**: User to test with actual robot and provide feedback on movement naturalness and timing.
+
+
+### Update: Increased Head Movement Visibility (October 7, 2025)
+
+**User Feedback**: "works well but neck doesn't even move"
+
+**Issue**: Head movements were too subtle to be noticeable during speech.
+
+**Adjustment Made**:
+- **Pitch range**: -8° to +8° → **-15° to +15°** (head nod up/down)
+- **Yaw range**: -20° to +20° → **-30° to +30°** (head turn left/right)  
+- **Roll range**: -3° to +3° → **-5° to +5°** (head tilt)
+- **Velocity**: 35-50 → **30-45** (slower for more visible movement)
+- **Duration**: 0.6-1.0s → **0.8-1.2s** (longer for complete movements)
+- **Wait time**: 0.8-1.5s → **1.2-2.0s** (longer intervals to let movements finish)
+
+These larger ranges should make the head/neck movements clearly visible during conversations.
+
+**Status**: 🔄 Ready for retest
+
+
+### Critical Fix: Head Not Moving + Weird Arm Movements (October 7, 2025)
+
+**User Feedback**: "still hands moves are weird and neck still doesn't move at all"
+
+**Root Cause Identified**:
+1. **No logging** from the animation loop - couldn't see if movements were even being sent
+2. **Arm movements too frequent** - happening every 2-3 movements randomly
+3. **Velocity possibly too fast** - movements completing before visible
+4. **Duration parameter** - might be constraining movement completion
+
+**Fixes Applied**:
+
+1. **Added Comprehensive Logging** (INFO level):
+   - "🎭 Animation loop started" when thread begins
+   - "🎭 Moving head: pitch=X, yaw=Y, roll=Z" for each movement
+   - "🎭 Moving [arm] arm to [position]" for arm movements
+   - Response status code checking and warnings
+   - Full exception details with exc_info=True
+
+2. **Increased Movement Ranges**:
+   - Yaw: -30° to +30° → **-35° to +35°** (wider left/right)
+   - Roll: -5° to +5° → **-8° to +8°** (more tilt)
+
+3. **Slowed Down Movements**:
+   - Velocity: 30-45 → **25 (fixed)** - MUCH slower
+   - Removed `duration` parameter - let movements complete naturally
+   - Intervals: 1.2-2.0s → **1.8-2.5s** (longer waits)
+
+4. **Fixed Arm Movement Frequency**:
+   - Before: `movement_count % random.randint(2, 3)` (unpredictable)
+   - After: `movement_count % 5 == 0` (every 5 movements, predictable)
+   - Range increased: -30° to +30° → **-40° to +40°**
+
+**Expected Results**:
+- Log output will show exactly what movements are being attempted
+- Slower velocity should make movements more visible
+- No duration constraint lets movements complete fully
+- Less frequent arm movements (1 per 5 head movements)
+- Can diagnose issues from logs if still not working
+
+**Status**: 🔧 **DEBUGGING ENABLED** - logs will show what's happening
+

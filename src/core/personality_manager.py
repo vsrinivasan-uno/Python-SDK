@@ -54,6 +54,10 @@ class PersonalityManager:
         self.on_enter_screensaver: Optional[callable] = None
         self.on_exit_screensaver: Optional[callable] = None
         
+        # Continuous speaking animation state
+        self.speaking_animation_active = False
+        self.speaking_animation_thread: Optional[threading.Thread] = None
+        
         # Available eye expressions (Misty's default images)
         self.eye_expressions = {
             "happy": "e_Joy.jpg",
@@ -170,6 +174,111 @@ class PersonalityManager:
             
         except Exception as e:
             self.logger.warning(f"Failed to play speaking animation: {e}")
+    
+    def start_continuous_speaking_movements(self):
+        """Start continuous natural movements while Misty is speaking.
+        
+        This runs in a background thread and does NOT block. It performs
+        random natural head and arm movements every 0.8-1.5 seconds during speech.
+        Call stop_continuous_speaking_movements() when speech is done.
+        """
+        if self.speaking_animation_active:
+            self.logger.debug("Continuous speaking animation already active")
+            return
+        
+        self.speaking_animation_active = True
+        self.speaking_animation_thread = threading.Thread(
+            target=self._continuous_speaking_loop,
+            daemon=True
+        )
+        self.speaking_animation_thread.start()
+        self.logger.debug("🎭 Started continuous speaking movements")
+    
+    def stop_continuous_speaking_movements(self):
+        """Stop continuous speaking movements."""
+        if not self.speaking_animation_active:
+            return
+        
+        self.speaking_animation_active = False
+        
+        # Wait for thread to finish (should be quick)
+        if self.speaking_animation_thread and self.speaking_animation_thread.is_alive():
+            self.speaking_animation_thread.join(timeout=2)
+        
+        # Reset to neutral pose
+        try:
+            self.misty.move_head(pitch=0, roll=0, yaw=0, velocity=50)
+            self.misty.move_arms(
+                leftArmPosition=0,
+                rightArmPosition=0,
+                leftArmVelocity=50,
+                rightArmVelocity=50
+            )
+        except Exception as e:
+            self.logger.debug(f"Failed to reset pose: {e}")
+        
+        self.logger.debug("🎭 Stopped continuous speaking movements")
+    
+    def _continuous_speaking_loop(self):
+        """Background loop for continuous natural movements during speech.
+        
+        This runs in a separate thread and performs random movements every 1.5-2.5s.
+        Does NOT use time.sleep() blocking calls - just sends movement commands.
+        """
+        self.logger.info("🎭 Animation loop started")
+        movement_count = 0
+        
+        while self.speaking_animation_active:
+            try:
+                # Random head position for MORE VISIBLE natural movement
+                # Increased ranges for more pronounced neck/head movements
+                pitch = random.randint(-15, 15)  # Up/down tilt
+                yaw = random.randint(-35, 35)    # Left/right turn - INCREASED MORE
+                roll = random.randint(-8, 8)     # Head tilt - INCREASED MORE
+                
+                # Log the movement we're about to make
+                self.logger.info(f"🎭 Moving head: pitch={pitch}, yaw={yaw}, roll={roll}")
+                
+                # Send head movement command (non-blocking)
+                # Use slower velocity and NO duration parameter (let it move freely)
+                response = self.misty.move_head(
+                    pitch=pitch,
+                    roll=roll,
+                    yaw=yaw,
+                    velocity=25  # MUCH SLOWER for very visible movement
+                )
+                
+                if response.status_code != 200:
+                    self.logger.warning(f"Head movement failed: {response.status_code}")
+                
+                # Less frequent arm movements (every 4-5 movements, not every 2-3)
+                if movement_count > 0 and movement_count % 5 == 0:
+                    arm = random.choice(["left", "right"])
+                    position = random.randint(-40, 40)  # Bigger arm movements
+                    self.logger.info(f"🎭 Moving {arm} arm to {position}")
+                    arm_response = self.misty.move_arm(
+                        arm=arm,
+                        position=position,
+                        velocity=35
+                    )
+                    if arm_response.status_code != 200:
+                        self.logger.warning(f"Arm movement failed: {arm_response.status_code}")
+                
+                # Occasionally show joy expression (every 4 movements)
+                if movement_count > 0 and movement_count % 4 == 0:
+                    self.show_expression("joy")
+                
+                movement_count += 1
+                
+                # Wait before next movement (longer interval to let movement complete)
+                wait_time = random.uniform(1.8, 2.5)  # LONGER intervals
+                time.sleep(wait_time)
+                
+            except Exception as e:
+                self.logger.error(f"❌ Error in continuous speaking animation: {e}", exc_info=True)
+                time.sleep(1.0)  # Back off on error
+        
+        self.logger.info("🎭 Animation loop ended")
     
     def greeting_animation(self):
         """Animate Misty when greeting someone (wave, happy eyes)."""

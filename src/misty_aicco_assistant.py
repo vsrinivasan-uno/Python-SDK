@@ -51,17 +51,20 @@ class AudioQueueManager:
     - Handling AudioPlayComplete events to trigger next chunk
     """
     
-    def __init__(self, misty, logger, config, on_response_complete=None):
+    def __init__(self, misty, logger, config, on_response_complete=None, personality_manager=None):
         """Initialize the AudioQueueManager.
         
         Args:
             misty: Misty robot instance
             logger: Logger instance
             config: Configuration object
+            on_response_complete: Optional callback when response is complete
+            personality_manager: Optional PersonalityManager for animations
         """
         self.misty = misty
         self.logger = logger
         self.config = config
+        self.personality_manager = personality_manager
         
         # Queue of chunks ready to play: [(filename, wav_data, is_final), ...]
         self.play_queue = []
@@ -72,6 +75,7 @@ class AudioQueueManager:
         self.currently_uploading = False  # Track if upload is in progress
         self.is_processing = False
         self.fallback_timer = None  # Timer for fallback playback completion
+        self.animations_started = False  # Track if we started continuous animations
         
         # Statistics
         self.chunks_received = 0
@@ -335,6 +339,15 @@ class AudioQueueManager:
                 self.logger.info(f"✅ Playback started for {filename}")
                 self.chunks_played += 1
                 
+                # Start continuous speaking animations on first chunk (non-blocking, parallel)
+                if not self.animations_started and self.personality_manager:
+                    try:
+                        self.personality_manager.start_continuous_speaking_movements()
+                        self.animations_started = True
+                        self.logger.debug("🎭 Started continuous speaking animations")
+                    except Exception as e:
+                        self.logger.warning(f"Failed to start speaking animations: {e}")
+                
                 # CRITICAL FIX: AudioPlayComplete event may not fire reliably for short chunks
                 # Calculate actual audio duration dynamically
                 if wav_data and len(wav_data) > 44:  # WAV header is 44 bytes
@@ -447,6 +460,15 @@ class AudioQueueManager:
         """Complete the response and return to idle state."""
         self.logger.info(f"📊 Response complete: {self.chunks_played}/{self.chunks_received} chunks played, {self.chunks_uploaded} chunks uploaded")
         
+        # Stop continuous speaking animations if they were started
+        if self.animations_started and self.personality_manager:
+            try:
+                self.personality_manager.stop_continuous_speaking_movements()
+                self.animations_started = False
+                self.logger.debug("🎭 Stopped continuous speaking animations")
+            except Exception as e:
+                self.logger.warning(f"Failed to stop speaking animations: {e}")
+        
         # Clean up any remaining files
         self._cleanup_all_files()
         
@@ -476,6 +498,14 @@ class AudioQueueManager:
             self.play_queue.clear()
             self.currently_playing = None
             self.is_processing = False
+        
+        # Stop animations if they were running
+        if self.animations_started and self.personality_manager:
+            try:
+                self.personality_manager.stop_continuous_speaking_movements()
+                self.animations_started = False
+            except Exception as e:
+                self.logger.warning(f"Failed to stop animations during clear: {e}")
         
         # Clean up all uploaded files
         self._cleanup_all_files()
@@ -914,7 +944,8 @@ class MistyAiccoAssistant:
                 self.misty,
                 self.logger,
                 self.config,
-                on_response_complete=self._exit_speaking_state_after_playback
+                on_response_complete=self._exit_speaking_state_after_playback,
+                personality_manager=self.personality_manager
             )
             self.logger.info("    ✅ Audio queue initialized")
             
@@ -1375,6 +1406,13 @@ class MistyAiccoAssistant:
             self.misty.change_led(*self.config.led.speaking)
             self.logger.info(f"🔊 Playing realtime audio: {filename}")
             
+            # Start continuous speaking animations (non-blocking, parallel)
+            if self.personality_manager:
+                try:
+                    self.personality_manager.start_continuous_speaking_movements()
+                except Exception as e:
+                    self.logger.warning(f"Failed to start speaking animations: {e}")
+            
             play_response = self.misty.play_audio(fileName=filename, volume=100)
             if play_response.status_code == 200:
                 self.logger.info("✅ Audio playback started")
@@ -1384,6 +1422,13 @@ class MistyAiccoAssistant:
         except Exception as e:
             self.logger.error(f"❌ Failed to play audio: {e}")
         finally:
+            # Stop continuous speaking animations
+            if self.personality_manager:
+                try:
+                    self.personality_manager.stop_continuous_speaking_movements()
+                except Exception as e:
+                    self.logger.warning(f"Failed to stop speaking animations: {e}")
+            
             self._exit_speaking_state_after_playback()
             self.logger.info("✅ Realtime response complete!")
     
