@@ -597,6 +597,10 @@ class MistyAiccoAssistant:
             # Add more people here as needed
         }
         
+        # Photo display settings
+        self.photo_display_duration = 3.0  # How long to show photo (seconds)
+        self.current_photo_timer = None    # Track current photo timer
+        
         # Track uploaded photos to avoid re-uploading
         self.uploaded_photos = {}  # person_name -> misty_filename
         
@@ -856,8 +860,8 @@ class MistyAiccoAssistant:
             self.logger.debug("ℹ️  Skipping audio monitor pause - greeting won't be delivered (cooldown active)")
         
         # Record interaction (resets idle timer)
-        if self.personality_manager:
-            self.personality_manager.record_interaction()
+        # if self.personality_manager:
+        #     self.personality_manager.record_interaction()
         
         # Display person's photo if available in dictionary
         self._display_person_photo(name)
@@ -870,13 +874,13 @@ class MistyAiccoAssistant:
             recognized_at = time.time()
             greeting_delivered = self.greeting_manager.greet_person(name, recognized_at=recognized_at)
             
-            # Run greeting animation asynchronously so it doesn't delay TTS (only if greeting was delivered)
-            if greeting_delivered and self.personality_manager and self.config.personality.animations_during_speech:
-                try:
-                    threading.Thread(target=self.personality_manager.greeting_animation, daemon=True).start()
-                except Exception:
-                    # Non-fatal if animation thread fails
-                    pass
+# Run greeting animation asynchronously so it doesn't delay TTS
+            # if self.personality_manager and self.config.personality.animations_during_speech:
+            #     try:
+            #         threading.Thread(target=self.personality_manager.greeting_animation, daemon=True).start()
+            #     except Exception:
+            #         # Non-fatal if animation thread fails
+            #         pass
             
             # RESUME AUDIO MONITOR after greeting completes (with delay for TTS)
             # BUT ONLY if we actually paused it (i.e., greeting was delivered)
@@ -1801,10 +1805,10 @@ class MistyAiccoAssistant:
                     except Exception as e:
                         self.logger.warning(f"Failed to return to default expression: {e}")
                 
-                # Schedule return to default after 3 seconds
-                timer = threading.Timer(3.0, return_to_default)
-                timer.daemon = True
-                timer.start()
+                # Schedule return to default after 3 seconds (FIXED: was 30!)
+                # timer = threading.Timer(3.0, return_to_default)
+                # timer.daemon = True
+                # timer.start()
                 
             else:
                 self.logger.error(f"❌ Failed to display photo: {response.status_code}")
