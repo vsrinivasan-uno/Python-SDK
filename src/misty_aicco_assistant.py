@@ -838,10 +838,22 @@ class MistyAiccoAssistant:
         
         self.logger.info(f"👤 Face recognized: {name} (confidence: {confidence:.2f})")
         
+        # DIAGNOSTIC: Check if greeting will actually be delivered (cooldown check)
+        will_greet = False
+        if self.greeting_manager:
+            will_greet = self.greeting_manager.should_greet(name)
+            self.logger.info(f"🔍 DIAGNOSTIC - Will greet {name}? {will_greet}")
+            if not will_greet:
+                cooldown_status = self.greeting_manager.get_greeting_status(name)
+                self.logger.info(f"   Cooldown remaining: {cooldown_status['cooldown_remaining']:.1f}s")
+        
         # PAUSE AUDIO MONITOR during face greeting to prevent conflicts
-        if self.audio_monitor:
+        # BUT ONLY if we're actually going to deliver a greeting
+        if self.audio_monitor and will_greet:
             self.logger.debug("⏸️  Pausing audio monitor for face greeting")
             self.audio_monitor.pause()
+        elif self.audio_monitor and not will_greet:
+            self.logger.debug("ℹ️  Skipping audio monitor pause - greeting won't be delivered (cooldown active)")
         
         # Record interaction (resets idle timer)
         if self.personality_manager:
@@ -851,14 +863,15 @@ class MistyAiccoAssistant:
         self._display_person_photo(name)
         
         # Task 2.2: Greet person with cooldown management
+        greeting_delivered = False
         if self.greeting_manager:
             # Request greeting immediately to minimize latency
             import time
             recognized_at = time.time()
-            self.greeting_manager.greet_person(name, recognized_at=recognized_at)
+            greeting_delivered = self.greeting_manager.greet_person(name, recognized_at=recognized_at)
             
-            # Run greeting animation asynchronously so it doesn't delay TTS
-            if self.personality_manager and self.config.personality.animations_during_speech:
+            # Run greeting animation asynchronously so it doesn't delay TTS (only if greeting was delivered)
+            if greeting_delivered and self.personality_manager and self.config.personality.animations_during_speech:
                 try:
                     threading.Thread(target=self.personality_manager.greeting_animation, daemon=True).start()
                 except Exception:
@@ -866,17 +879,21 @@ class MistyAiccoAssistant:
                     pass
             
             # RESUME AUDIO MONITOR after greeting completes (with delay for TTS)
-            # Schedule resume in background thread to avoid blocking
-            def resume_after_greeting():
-                time.sleep(3.0)  # Wait for greeting to complete (adjust based on typical greeting length)
-                if self.audio_monitor:
-                    self.logger.debug("▶️  Resuming audio monitor after face greeting")
-                    self.audio_monitor.resume()
-                    # Restart wake word detection if not in conversation mode
-                    if not self.conversation_active:
-                        self.audio_monitor.restart_wake_word_detection()
-            
-            threading.Thread(target=resume_after_greeting, daemon=True).start()
+            # BUT ONLY if we actually paused it (i.e., greeting was delivered)
+            if greeting_delivered:
+                # Schedule resume in background thread to avoid blocking
+                def resume_after_greeting():
+                    time.sleep(3.0)  # Wait for greeting to complete (adjust based on typical greeting length)
+                    if self.audio_monitor:
+                        self.logger.debug("▶️  Resuming audio monitor after face greeting")
+                        self.audio_monitor.resume()
+                        # Restart wake word detection if not in conversation mode
+                        if not self.conversation_active:
+                            self.audio_monitor.restart_wake_word_detection()
+                
+                threading.Thread(target=resume_after_greeting, daemon=True).start()
+            else:
+                self.logger.debug("ℹ️  Skipping audio monitor resume - it was never paused (cooldown active)")
     
     def _initialize_voice_assistant(self):
         """Initialize voice assistant module.
