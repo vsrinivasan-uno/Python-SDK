@@ -782,16 +782,22 @@ class MistyAiccoAssistant:
         self.logger.info("Initializing face recognition...")
         
         try:
-            # Initialize greeting manager first
+            # Initialize greeting manager first (will be updated with realtime handler if in realtime mode)
             self.logger.info("Setting up greeting manager...")
             self.greeting_manager = GreetingManager(
                 misty=self.misty,
                 greeting_templates=self.config.face_recognition.greeting_templates,
                 cooldown_seconds=self.config.face_recognition.greeting_cooldown_seconds,
                 greeting_led_color=self.config.led.greeting,
-                idle_led_color=self.config.led.idle
+                idle_led_color=self.config.led.idle,
+                vip_persons=self.config.face_recognition.vip_persons,
+                realtime_handler=None,  # Will be set after voice assistant initialization if in realtime mode
+                audio_queue_manager=None,  # Will be set after voice assistant initialization if in realtime mode
+                use_realtime_api=False  # Will be updated if voice mode is realtime
             )
             self.logger.info(f"✅ Greeting manager initialized ({self.config.face_recognition.greeting_cooldown_seconds}s cooldown)")
+            if self.config.face_recognition.vip_persons:
+                self.logger.info(f"   🌟 VIP persons: {', '.join(self.config.face_recognition.vip_persons.keys())}")
             
             # Create face recognition manager with callback
             self.face_recognition_manager = FaceRecognitionManager(
@@ -882,18 +888,23 @@ class MistyAiccoAssistant:
             #         # Non-fatal if animation thread fails
             #         pass
             
-            # RESUME AUDIO MONITOR after greeting completes (with delay for TTS)
+            # RESUME AUDIO MONITOR after greeting completes (with delay for audio)
             # BUT ONLY if we actually paused it (i.e., greeting was delivered)
             if greeting_delivered:
                 # Schedule resume in background thread to avoid blocking
                 def resume_after_greeting():
-                    time.sleep(3.0)  # Wait for greeting to complete (adjust based on typical greeting length)
+                    # Wait for greeting audio to complete
+                    # Local cached greetings are typically 2-4 seconds
+                    # Add buffer for upload/playback initialization
+                    time.sleep(5.0)  # Increased from 3s to 5s for reliable completion
                     if self.audio_monitor:
                         self.logger.debug("▶️  Resuming audio monitor after face greeting")
                         self.audio_monitor.resume()
                         # Restart wake word detection if not in conversation mode
                         if not self.conversation_active:
+                            self.logger.info("🔄 Restarting wake word detection after greeting...")
                             self.audio_monitor.restart_wake_word_detection()
+                            self.logger.info("✅ Wake word detection restarted - 'Hey Misty' is now active!")
                 
                 threading.Thread(target=resume_after_greeting, daemon=True).start()
             else:
@@ -1030,6 +1041,16 @@ class MistyAiccoAssistant:
         # Connect to the API
         self.realtime_handler.connect()
         self.logger.info("    ✅ Realtime API connected")
+        
+        # Update greeting manager to use Realtime API if configured
+        if self.greeting_manager and self.config.face_recognition.enabled and self.config.face_recognition.use_realtime_for_greetings:
+            self.logger.info("  - Configuring greeting manager to use Realtime API...")
+            self.greeting_manager.realtime_handler = self.realtime_handler
+            self.greeting_manager.audio_queue_manager = self.audio_queue
+            self.greeting_manager.use_realtime_api = True
+            self.logger.info("    ✅ Greeting manager will use OpenAI Realtime API for consistent voice")
+        elif self.greeting_manager and self.config.face_recognition.enabled:
+            self.logger.info("  - Greeting manager will use Misty's built-in TTS")
         
         # Log configuration
         if self.config.voice_assistant.audio_chunking_enabled:

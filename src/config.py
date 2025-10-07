@@ -35,6 +35,8 @@ class FaceRecognitionConfig:
     enabled: bool = True
     greeting_cooldown_seconds: int = 300  # 5 minutes default
     greeting_templates: list = None
+    vip_persons: dict = None  # VIP persons with custom greetings
+    use_realtime_for_greetings: bool = True  # Use OpenAI Realtime API for consistent voice (only if voice_mode is realtime)
     
     def __post_init__(self):
         if self.greeting_templates is None:
@@ -44,6 +46,19 @@ class FaceRecognitionConfig:
                 "Hey {name}! How are you doing?",
                 "Welcome back, {name}!",
             ]
+        
+        if self.vip_persons is None:
+            # VIP persons with custom greeting messages
+            self.vip_persons = {
+                "Mayor_John_W_Ewing_Junior": "Hi Mayor John W Ewing Junior. Delighted to have you visit our AI CORE booth. I am Misty, the newest member of AI-CCORE. I am powered by the Weitz Innovation Fund. We are super excited about the various AI initiatives that the University of Nebraska Omaha has embarked under your leadership. Our BS and MS AI degrees are the first in the state. They are supported by the AI Learning Lab and AI-CCORE centers that provide holistic AI training and hands-on experience to UNO faculty, students, our local industry, and the larger community. I am delighted to take part in this awesome journey to create a responsible future AI workforce in the city of Omaha the State of Nebraska and beyond. To start conversation with me say Hey Misty and ask about UNO AI programs. My twin knows more about AI-CCORE and AI Learning Lab.",
+                "Chancellor_Joanne_Li": "Hi Chancellor Joanne Li. Delighted to have you visit our AI CORE booth. I am Misty, the newest member of AI-CCORE. I am powered by the Weitz Innovation Fund. We are super excited about the various AI initiatives that the University of Nebraska Omaha has embarked under your leadership. Our BS and MS AI degrees are the first in the state. They are supported by the AI Learning Lab and AI-CCORE centers that provide holistic AI training and hands-on experience to UNO faculty, students, our local industry, and the larger community. I am delighted to take part in this awesome journey to create a responsible future AI workforce in the city of Omaha the State of Nebraska and beyond. To start conversation with me say Hey Misty and ask about UNO AI programs. My twin knows more about AI-CCORE and AI Learning Lab.",
+                "President_Heath_Mello": "Hi President Heath Mello. Delighted to have you visit our AI CORE booth. I am Misty, the newest member of AI-CCORE. I am powered by the Weitz Innovation Fund. We are super excited about the various AI initiatives that the University of Nebraska Omaha has embarked under your leadership. Our BS and MS AI degrees are the first in the state. They are supported by the AI Learning Lab and AI-CCORE centers that provide holistic AI training and hands-on experience to UNO faculty, students, our local industry, and the larger community. I am delighted to take part in this awesome journey to create a responsible future AI workforce in the city of Omaha the State of Nebraska and beyond. To start conversation with me say Hey Misty and ask about UNO AI programs. My twin knows more about AI-CCORE and AI Learning Lab.",
+                "Associate_Dean_Robin_Gandhi": "Hi Associate Dean Robin Gandhi. Delighted to have you visit our AI CORE booth. I am Misty, the newest member of AI-CCORE. I am powered by the Weitz Innovation Fund. We are super excited about the various AI initiatives that the University of Nebraska Omaha has embarked under your leadership. Our BS and MS AI degrees are the first in the state. They are supported by the AI Learning Lab and AI-CCORE centers that provide holistic AI training and hands-on experience to UNO faculty, students, our local industry, and the larger community. I am delighted to take part in this awesome journey to create a responsible future AI workforce in the city of Omaha the State of Nebraska and beyond. To start conversation with me say Hey Misty and ask about UNO AI programs. My twin knows more about AI-CCORE and AI Learning Lab.",
+                "Dean_Martha_Garcia_Murillo": "Hi Dean Martha Garcia Murillo. Delighted to have you visit our AI CORE booth. I am Misty, the newest member of AI-CCORE. I am powered by the Weitz Innovation Fund. We are super excited about the various AI initiatives that the University of Nebraska Omaha has embarked under your leadership. Our BS and MS AI degrees are the first in the state. They are supported by the AI Learning Lab and AI-CCORE centers that provide holistic AI training and hands-on experience to UNO faculty, students, our local industry, and the larger community. I am delighted to take part in this awesome journey to create a responsible future AI workforce in the city of Omaha the State of Nebraska and beyond. To start conversation with me say Hey Misty and ask about UNO AI programs. My twin knows more about AI-CCORE and AI Learning Lab.",
+                "Senior_Vice_Chancellor_Phil": "Hi Senior Vice Chancellor Phil. Delighted to have you visit our AI CORE booth. I am Misty, the newest member of AI-CCORE. I am powered by the Weitz Innovation Fund. We are super excited about the various AI initiatives that the University of Nebraska Omaha has embarked under your leadership. Our BS and MS AI degrees are the first in the state. They are supported by the AI Learning Lab and AI-CCORE centers that provide holistic AI training and hands-on experience to UNO faculty, students, our local industry, and the larger community. I am delighted to take part in this awesome journey to create a responsible future AI workforce in the city of Omaha the State of Nebraska and beyond. To start conversation with me say Hey Misty and ask about UNO AI programs. My twin knows more about AI-CCORE and AI Learning Lab.",
+                "Cassie_Mallette": "Hi Cassie Mallette. Delighted to have you visit our AI CORE booth. I am Misty, the newest member of AI-CCORE. I am powered by the Weitz Innovation Fund. We are super excited about the various AI initiatives that the University of Nebraska Omaha has embarked under your leadership. Our BS and MS AI degrees are the first in the state. They are supported by the AI Learning Lab and AI-CCORE centers that provide holistic AI training and hands-on experience to UNO faculty, students, our local industry, and the larger community. I am delighted to take part in this awesome journey to create a responsible future AI workforce in the city of Omaha the State of Nebraska and beyond. To start conversation with me say Hey Misty and ask about UNO AI programs. My twin knows more about AI-CCORE and AI Learning Lab.",
+                "Chancellor_Jaci_Lindburg": "Hi Associate Vice Chanellor Jaci Lindburg. Delighted to have you visit our AI CORE booth. I am Misty, the newest member of AI-CCORE. I am powered by the Weitz Innovation Fund. We are super excited about the various AI initiatives that the University of Nebraska Omaha has embarked under your leadership. Our BS and MS AI degrees are the first in the state. They are supported by the AI Learning Lab and AI-CCORE centers that provide holistic AI training and hands-on experience to UNO faculty, students, our local industry, and the larger community. I am delighted to take part in this awesome journey to create a responsible future AI workforce in the city of Omaha the State of Nebraska and beyond. To start conversation with me say Hey Misty and ask about UNO AI programs. My twin knows more about AI-CCORE and AI Learning Lab."
+            }
 
 
 @dataclass
@@ -136,10 +151,12 @@ class Config:
         """Load face recognition configuration."""
         enabled = os.getenv("FACE_RECOGNITION_ENABLED", "true").lower() == "true"
         cooldown = int(os.getenv("GREETING_COOLDOWN_SECONDS", "300"))
+        use_realtime_greetings = os.getenv("USE_REALTIME_FOR_GREETINGS", "true").lower() == "true"
         
         return FaceRecognitionConfig(
             enabled=enabled,
-            greeting_cooldown_seconds=cooldown
+            greeting_cooldown_seconds=cooldown,
+            use_realtime_for_greetings=use_realtime_greetings
         )
     
     def _load_voice_assistant_config(self) -> VoiceAssistantConfig:
@@ -276,6 +293,9 @@ class Config:
         print(f"  Enabled: {self.face_recognition.enabled}")
         print(f"  Greeting Cooldown: {self.face_recognition.greeting_cooldown_seconds}s")
         print(f"  Greeting Templates: {len(self.face_recognition.greeting_templates)} templates")
+        print(f"  Use Realtime API for Greetings: {self.face_recognition.use_realtime_for_greetings}")
+        if self.face_recognition.use_realtime_for_greetings:
+            print(f"    ↳ Greetings will use same voice as assistant (only in realtime mode)")
         
         print(f"\n[Voice Assistant]")
         print(f"  Enabled: {self.voice_assistant.enabled}")
