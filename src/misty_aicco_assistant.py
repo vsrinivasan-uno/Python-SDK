@@ -1012,6 +1012,13 @@ class MistyAiccoAssistant:
         """
         self.logger.info("🎤 Wake word detected!")
         
+        # DIAGNOSTIC: Log current system state when wake word is detected
+        self.logger.info(f"🔍 DIAGNOSTIC - System State at Wake Word:")
+        self.logger.info(f"   - In screensaver: {self.personality_manager.in_screensaver if self.personality_manager else 'N/A'}")
+        self.logger.info(f"   - Services stopped: {self.services_stopped}")
+        self.logger.info(f"   - Conversation active: {self.conversation_active}")
+        self.logger.info(f"   - Speaking lock: {self.speaking_lock}")
+        
         # PAUSE FACE RECOGNITION during voice interaction to prevent conflicts
         if self.face_recognition_manager and self.face_recognition_manager.running:
             self.logger.debug("⏸️  Pausing face recognition for voice interaction")
@@ -1019,6 +1026,7 @@ class MistyAiccoAssistant:
         
         # Record interaction (resets idle timer, wakes from screensaver if needed)
         if self.personality_manager:
+            self.logger.info("🔄 Recording interaction - will exit screensaver if active")
             self.personality_manager.record_interaction()
         
         # Start conversation mode if enabled
@@ -1747,9 +1755,25 @@ class MistyAiccoAssistant:
                 self.logger.info("   Stopping face recognition (camera off)...")
                 self.face_recognition_manager.stop()
             
-            # KEEP audio monitor running so we can hear "Hey Misty" to wake up!
-            # Note: Not stopping audio monitor - wake word detection stays active
-            self.logger.info("   Audio monitor stays active - listening for 'Hey Misty' to wake up")
+            # DIAGNOSTIC: Check audio monitor state before screensaver
+            if self.audio_monitor:
+                status = self.audio_monitor.get_status()
+                self.logger.info(f"🔍 DIAGNOSTIC - Audio Monitor State:")
+                self.logger.info(f"   - Running: {status['running']}")
+                self.logger.info(f"   - Paused: {status['paused']}")
+                self.logger.info(f"   - Mode: {status['mode']}")
+                
+                # CRITICAL FIX: Ensure audio monitor is active and listening for wake word
+                if status['paused']:
+                    self.logger.warning("⚠️  Audio monitor was PAUSED - resuming for wake word detection")
+                    self.audio_monitor.resume()
+                
+                # CRITICAL FIX: Restart wake word detection to ensure it's active in screensaver
+                self.logger.info("🔄 Restarting wake word detection for screensaver mode...")
+                self.audio_monitor.restart_wake_word_detection()
+                self.logger.info("✅ Wake word detection restarted - 'Hey Misty' will wake from screensaver")
+            else:
+                self.logger.warning("⚠️  Audio monitor not initialized - wake word won't work!")
             
             self.services_stopped = True
             self.logger.info("✅ Screensaver active - say 'Hey Misty' to wake up anytime!")
@@ -1770,9 +1794,23 @@ class MistyAiccoAssistant:
                 self.logger.info("   Restarting face recognition (camera on)...")
                 self.face_recognition_manager.start()
             
-            # Audio monitor was never stopped - it stayed active for wake word detection
-            # No need to restart it
-            self.logger.info("   Audio monitor already active")
+            # DIAGNOSTIC: Verify audio monitor is still working after wake
+            if self.audio_monitor:
+                status = self.audio_monitor.get_status()
+                self.logger.info(f"🔍 DIAGNOSTIC - Audio Monitor State After Wake:")
+                self.logger.info(f"   - Running: {status['running']}")
+                self.logger.info(f"   - Paused: {status['paused']}")
+                self.logger.info(f"   - Mode: {status['mode']}")
+                
+                # Ensure audio monitor is ready for next wake word
+                if status['paused']:
+                    self.logger.warning("⚠️  Audio monitor was paused after wake - resuming")
+                    self.audio_monitor.resume()
+                    self.audio_monitor.restart_wake_word_detection()
+                
+                self.logger.info("✅ Audio monitor verified - ready for 'Hey Misty'")
+            else:
+                self.logger.warning("⚠️  Audio monitor not initialized")
             
             self.services_stopped = False
             self.logger.info("✅ Services restarted - ready for interactions!")
