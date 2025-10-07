@@ -4042,3 +4042,304 @@ When user says "thank you", logs should now show:
 
 **Key Fix**: Enabled input audio transcription in Realtime API session config, allowing system to see what user says
 
+---
+
+## Latest Fix: Mutual Exclusion Between Face Recognition and Voice Interaction (October 7, 2025)
+
+### Problem Identified
+Face recognition and voice interaction events were running simultaneously, causing conflicts:
+- Both systems operating in parallel at all times
+- Face recognition could trigger greetings while voice interaction was active
+- Voice interaction could process while face recognition was greeting
+- Led to confusing behavior and potential conflicts in LED states, audio output, and system resources
+
+### Root Cause
+No mutual exclusion mechanism existed between the two primary interaction modes:
+1. **Face Recognition System**: Continuously runs, triggers greetings when faces detected
+2. **Voice Interaction System**: Continuously listens for wake word, processes speech
+
+Both were completely independent, causing resource conflicts and poor UX.
+
+### Solution Implemented
+Implemented mutual exclusion with proper pause/resume logic:
+
+#### 1. Face Recognition → Pause Audio During Greeting
+**File**: `src/misty_aicco_assistant.py`, method `_on_face_recognized()`
+- Added check to ignore face recognition during active voice interaction
+- Pause audio monitor when face greeting starts
+- Resume audio monitor after greeting completes (3-second delay for TTS)
+- Restart wake word detection if not in conversation mode
+
+#### 2. Voice Interaction → Pause Face Recognition During Speech
+**File**: `src/misty_aicco_assistant.py`, method `_on_wake_word_detected()`
+- Stop face recognition when wake word detected
+- Keeps face recognition paused during entire voice interaction
+
+#### 3. Resume Face Recognition After Voice Interaction
+**File**: `src/misty_aicco_assistant.py`, method `_exit_speaking_state_after_playback()`
+- Resume face recognition when voice interaction completes (not in conversation mode)
+- Keep face recognition paused during conversation mode
+- Resume face recognition when conversation mode ends
+
+#### 4. Resume Face Recognition After Conversation Ends
+**File**: `src/misty_aicco_assistant.py`, method `_end_conversation()`
+- Resume face recognition when conversation mode ends
+- Return to normal dual-mode operation
+
+### Changes Summary
+**Modified File**: `src/misty_aicco_assistant.py`
+- `_on_face_recognized()`: Added audio monitor pause/resume logic
+- `_on_wake_word_detected()`: Added face recognition pause
+- `_exit_speaking_state_after_playback()`: Added face recognition resume
+- `_end_conversation()`: Added face recognition resume
+
+### Expected Behavior (FINAL - October 7, 2025)
+1. **Startup/Initial Idle State**: Both face recognition AND audio monitoring active
+2. **Face Recognized** (before any voice interaction): 
+   - Audio monitoring paused temporarily
+   - Greeting plays
+   - Audio monitoring resumed after 3 seconds
+   - Face recognition continues running
+3. **"Hey Misty" Detected**:
+   - Face recognition stopped (during voice interaction)
+   - Voice interaction proceeds
+   - Face recognition stays OFF during conversation
+4. **Conversation Mode**:
+   - Face recognition stays OFF throughout
+   - User can continue asking questions without "Hey Misty"
+5. **Conversation Ends** (user says "thank you" or timeout):
+   - Audio monitor returns to wake word listening
+   - Face recognition **RESUMES** (back to greeting mode)
+   - System returns to initial state ready to greet new people
+6. **Single Voice Query** (without conversation mode):
+   - Face recognition stays OFF until system is restarted
+
+### Testing Instructions
+1. Start the assistant normally
+2. **Test Face Recognition**: Stand in front of Misty → Should greet, no wake word detection during greeting
+3. **Test Voice Interaction**: Say "Hey Misty" → Face recognition should stop, process voice
+4. **Test Conversation Mode**: Have multi-turn conversation → Face recognition stays paused
+5. **Test Return to Idle**: Say "thank you" to end conversation → Both systems resume
+
+### Status
+✅ **MUTUAL EXCLUSION FIX COMPLETE** - Face recognition and voice interaction now properly isolated
+
+**Key Benefits**:
+- No more simultaneous conflicting events
+- Cleaner system state management
+- Better user experience with clear interaction modes
+- Proper resource management
+
+### Additional Fix: Enhanced Logging for Face Recognition Resume (October 7, 2025)
+
+**Issue Reported**: User noted that after "💚 Returned to idle state" message, face recognition was not resuming.
+
+**Debugging Enhancement Made**:
+Added comprehensive logging throughout the face recognition resume flow to diagnose the issue:
+
+1. **AudioQueueManager._complete_response()**: Added logs when callback is invoked
+   - `"📞 Calling on_response_complete callback to resume assistant state..."`
+   - `"✅ on_response_complete callback completed"`
+
+2. **_exit_speaking_state_after_playback()**: Added detailed status logging
+   - Entry log: `"🔄 Exiting speaking state..."`
+   - Branch detection: `"🏠 Returning to normal idle mode..."` or `"💬 Conversation mode active..."`
+   - Face recognition status check: Shows `running` state and config `enabled` state
+   - Resume attempt: `"▶️  Resuming face recognition after voice interaction"`
+   - Success confirmation: `"✅ Face recognition resumed successfully!"`
+   - Exit log: `"🔓 Speaking lock released"`
+
+3. **_end_conversation()**: Added detailed logging for conversation end
+   - Face recognition manager status
+   - Config enabled status
+   - Resume attempt and result
+
+**Expected Log Output After Voice Interaction**:
+```
+💚 Returned to idle state
+📞 Calling on_response_complete callback to resume assistant state...
+🔄 Exiting speaking state...
+🏠 Returning to normal idle mode...
+👀 Checking face recognition status for resume...
+   Face recognition manager exists: running=False
+   Face recognition enabled in config: True
+▶️  Resuming face recognition after voice interaction
+📹 Checking camera service status...
+✅ Camera service is enabled
+📸 Testing camera functionality...
+✅ Camera is capturing images successfully
+🚀 Starting face recognition service...
+✅ Face recognition service started
+📡 Registering face recognition event listener...
+✅ Event listener registered successfully
+💡 LED set to RGB(0, 100, 255) - Camera Active Indicator
+✅ Face recognition monitoring started (continuous mode)
+👀 Camera is ON and monitoring for faces...
+✅ Face recognition resumed successfully!
+🔓 Speaking lock released
+✅ on_response_complete callback completed
+```
+
+**Next Step**: User should run the assistant and share the log output after saying "Hey Misty" and getting a response. This will show exactly where the face recognition resume is failing (if it's failing) or confirm it's working correctly.
+
+---
+
+## Behavior Change: Face Recognition Stays OFF After Voice Interaction (October 7, 2025)
+
+### User Requirement Clarification (FINAL)
+User clarified that face recognition should:
+- ✅ Run at startup (to greet people who approach)
+- ⏸️  **STOP** when someone says "Hey Misty" (during conversation)
+- ✅ **RESUME** when conversation ends (user says "thank you" or timeout)
+- ❌ **NOT resume** after single voice query (if conversation mode disabled)
+
+**Reasoning**: Face recognition welcomes people initially. During conversation it pauses to avoid conflicts. When conversation fully ends (with ending phrase like "thank you"), the system returns to greeting mode ready for the next person.
+
+### Changes Made (FINAL)
+**Modified Files**: `src/misty_aicco_assistant.py`
+
+1. **`_exit_speaking_state_after_playback()`**: 
+   - Does NOT resume face recognition after single voice query
+   - Only restarts wake word detection
+   - Log: "Face recognition remains OFF (only active at startup before voice interaction)"
+
+2. **`_end_conversation()`** (FINAL FIX):
+   - **RESUMES face recognition** when conversation ends with ending phrase
+   - Comprehensive logging to show resume status
+   - Returns system to greeting mode
+   - Log: "✅ Face recognition resumed successfully - back to greeting mode!"
+
+### New Behavior Flow (FINAL)
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ STARTUP / GREETING MODE                                      │
+│ - Face Recognition: ON (greeting people)                    │
+│ - Audio Monitor: ON (listening for "Hey Misty")             │
+└─────────────────────────────────────────────────────────────┘
+                           ↓
+         ┌─────────────────┴─────────────────┐
+         │                                    │
+    Face Detected                        "Hey Misty" Detected
+         │                                    │
+         ↓                                    ↓
+┌────────────────────┐              ┌──────────────────────┐
+│ FACE GREETING      │              │ CONVERSATION MODE    │
+│ - Pause audio      │              │ - STOP face recog    │
+│ - Play greeting    │              │   (temporarily)      │
+│ - Resume audio     │              │ - Multi-turn chat    │
+│ - Face recog ON    │              │ - No "Hey Misty"     │
+└────────────────────┘              │   needed             │
+         │                          └──────────────────────┘
+         │                                    ↓
+         │                          User says "thank you"
+         │                                    ↓
+         │                          ┌──────────────────────┐
+         │                          │ BACK TO GREETING     │
+         │                          │ - Audio: Wake word   │
+         └──────────────────────────┤ - Face recog: ON ✓   │
+                                    │   (RESUMES!)         │
+                                    └──────────────────────┘
+                                              ↓
+                                    Ready for next person
+```
+
+### Rationale (FINAL)
+This design makes sense because:
+1. **Initial greeting**: Face recognition welcomes people who approach Misty
+2. **Voice focus**: During conversation, face recognition pauses to avoid conflicts
+3. **Return to greeting**: When conversation ends, system returns to greeting mode ready for next person
+4. **Complete cycle**: User gets greeted → has conversation → says goodbye → system ready for next user
+5. **Resource efficiency**: Face recognition only paused during active conversation
+
+### Log Output Scenarios
+
+#### Scenario 1: Conversation Ends with "Thank You"
+```
+👤 User input transcript: 'thank you'
+🚪 Ending phrase detected: 'thank you' - exiting conversation mode
+🎬 Ending conversation mode - returning to greeting mode
+🔄 Restarting wake word detection...
+👀 Resuming face recognition after conversation ends...
+   Face recognition manager exists: running=False
+   Face recognition enabled in config: True
+▶️  Starting face recognition (returning to greeting mode)...
+📹 Checking camera service status...
+✅ Camera service is enabled
+🚀 Starting face recognition service...
+✅ Face recognition service started
+📡 Registering face recognition event listener...
+✅ Event listener registered successfully
+✅ Face recognition resumed successfully - back to greeting mode!
+```
+
+#### Scenario 2: Single Voice Query (No Conversation Mode)
+```
+💚 Returned to idle state
+📞 Calling on_response_complete callback to resume assistant state...
+🔄 Exiting speaking state...
+🏠 Returning to wake word listening mode...
+👀 Face recognition remains OFF (only active at startup before voice interaction)
+🔓 Speaking lock released
+```
+
+### Testing
+1. **Start assistant** → Face recognition ON, audio ON
+2. **Stand in front** → Gets greeting, face recognition stays ON
+3. **Say "Hey Misty"** → Face recognition turns OFF during conversation
+4. **Have conversation** → Multiple turns, face recognition stays OFF
+5. **Say "thank you"** → Conversation ends, face recognition **RESUMES**
+6. **Next person approaches** → System greets them (full cycle complete!)
+
+---
+
+## Critical Bug Fix: Face Recognition Events Being Blocked (October 7, 2025)
+
+### Issue Found in Logs
+User tested the system and face recognition appeared to resume but wasn't working. Log analysis showed:
+
+```
+✅ Face recognition resumed successfully - back to greeting mode!  [at 01:07:03]
+...
+Ignoring face recognition during voice interaction  [at 01:07:12, 01:07:14, 01:07:15]
+```
+
+**Problem**: Face recognition WAS running and detecting faces, but the `_on_face_recognized()` callback was **blocking all events**.
+
+### Root Cause
+In `_on_face_recognized()` line 788-790, there was an overly aggressive check:
+```python
+if self.audio_monitor and self.audio_monitor.is_running() and not self.audio_monitor.paused:
+    self.logger.debug("Ignoring face recognition during voice interaction")
+    return
+```
+
+This check was blocking face recognition whenever:
+- Audio monitor is running (which is ALWAYS, since it listens for "Hey Misty")
+- Audio monitor is not paused (which is TRUE after conversation ends)
+
+**Result**: Face recognition events were always blocked after returning to idle mode!
+
+### Fix Applied
+Changed the check to only block during actual conversation:
+```python
+# Ignore face recognition during active conversation mode
+if self.conversation_active:
+    self.logger.debug("Ignoring face recognition during active conversation")
+    return
+```
+
+Now face recognition is only blocked when:
+1. `speaking_lock` is True (during TTS playback)
+2. `conversation_active` is True (during multi-turn conversation)
+
+### Expected Behavior After Fix
+- ✅ Face recognition works at startup
+- ✅ Face recognition greets people before voice interaction
+- ✅ Face recognition blocked during conversation
+- ✅ Face recognition **RESUMES AND WORKS** after "thank you"
+- ✅ Face recognition continues greeting new people
+
+### Status
+🔧 **CRITICAL BUG FIXED** - Face recognition events now properly processed after conversation ends
+
